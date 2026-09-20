@@ -154,16 +154,29 @@ async fn agui_studio(
     uri: Uri,
     body: Bytes,
 ) -> axum::response::Response {
-    if is_websocket_upgrade(&headers) {
-        return websocket_unsupported(uri.path());
-    }
     if state.tab != SystemTab::Chat {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let Some(session) = state.proxy.live.session() else {
+    handle_studio_agui(&state.proxy, &state.origin, method, headers, uri, body).await
+}
+
+/// Studio-owned AG-UI run: `session.client` + streamed SSE. Used on the Chat
+/// loopback port and on chrome `/api/studio/ag-ui`.
+pub async fn handle_studio_agui(
+    proxy: &Proxy,
+    chat_origin: &str,
+    method: Method,
+    headers: HeaderMap,
+    uri: Uri,
+    body: Bytes,
+) -> axum::response::Response {
+    if is_websocket_upgrade(&headers) {
+        return websocket_unsupported(uri.path());
+    }
+    let Some(session) = proxy.live.session() else {
         return unauthorized();
     };
-    let Some(pq) = agui_upstream_path(&headers, uri.query(), &state.origin) else {
+    let Some(pq) = agui_upstream_path(&headers, uri.query(), chat_origin) else {
         return (
             StatusCode::BAD_REQUEST,
             axum::Json(serde_json::json!({ "error": "ag-ui url вне chat origin" })),
@@ -180,12 +193,12 @@ async fn agui_studio(
     // Stream path: never consult InjectCache.
     let mut res = forward_sso(
         &session,
-        &state.origin,
+        chat_origin,
         method,
         &pq,
         incoming,
         body,
-        state.proxy.cfg.stream_timeout,
+        proxy.cfg.stream_timeout,
     )
     .await;
     res.headers_mut().insert(
@@ -1103,7 +1116,9 @@ mod tests {
         assert!(AGUI_INJECT_JS.contains("/api/studio/ag-ui"));
         assert!(AGUI_INJECT_JS.contains("X-Studio-Agui-Url"));
         assert!(AGUI_INJECT_JS.contains("text/event-stream"));
+        assert!(AGUI_INJECT_JS.contains("application/json"));
         assert!(AGUI_INJECT_JS.contains("EventSource"));
+        assert!(!AGUI_INJECT_JS.contains("looksAguiUrl"));
     }
 
     #[test]
