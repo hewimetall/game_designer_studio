@@ -8,9 +8,11 @@
 //! CopilotKit `HttpAgent`, not protobuf; `@ag-ui/client` is not imported).
 //! Cancel is `POST /api/runs/{runId}/cancel`. Relative `/api/runs` already hits the Chat
 //! loopback SSO proxy (`is_chat_run_sse_path`). The inject script still patches
-//! `window.fetch` so GET event-stream / GET `/api/runs/{uuid}` (relative or
-//! absolute) is rewritten to [`STUDIO_AGUI_PATH`] with the native jar. POST
-//! `/api/agent/*` stays JSON through the SSO proxy.
+//! `window.fetch` so only GET `/api/runs/{uuid}[?since=]` (relative or absolute)
+//! is rewritten to [`STUDIO_AGUI_PATH`] with the native jar — that is the only
+//! target [`agui_upstream_path`] forwards. `Accept: text/event-stream` alone
+//! never triggers the rewrite: other Chat SSE (e.g. `GET /api/threads/{id}/runs`)
+//! stays on the SSO proxy. POST `/api/agent/*` stays JSON through the SSO proxy.
 
 use axum::http::HeaderMap;
 
@@ -25,34 +27,15 @@ pub const STUDIO_INJECT_JS_PATH: &str = "/api/studio/ag-ui-inject.js";
 pub const INJECT_MARKER: &str = "data-studio-agui-inject";
 pub const INJECT_SCRIPT_ID: &str = "studio-agui-inject";
 
-/// Patch `window.fetch`: GET event-stream or GET `/api/runs/{uuid}` → streamer.
-/// POST `/api/agent/*` is not rewritten. Production uses `fetch` + `getReader()`,
+/// Patch `window.fetch`: only GET `/api/runs/{uuid}` → streamer. The Accept
+/// header is forwarded untouched but never decides the rewrite. POST
+/// `/api/agent/*` is not rewritten. Production uses `fetch` + `getReader()`,
 /// not `EventSource`.
 pub const INJECT_JS: &str = r#"(function(){
   if (window.__STUDIO_AGUI_INJECT__) return;
   window.__STUDIO_AGUI_INJECT__ = true;
   try { document.documentElement.setAttribute("data-studio-agui-inject","1"); } catch (e) {}
   var EP = location.origin + "/api/studio/ag-ui";
-  function headerOf(h, name) {
-    name = String(name).toLowerCase();
-    if (!h) return "";
-    try {
-      if (typeof Headers !== "undefined" && h instanceof Headers) {
-        return h.get(name) || "";
-      }
-    } catch (e) {}
-    if (typeof h.get === "function") {
-      try { return h.get(name) || ""; } catch (e) {}
-    }
-    if (typeof h === "object") {
-      for (var k in h) {
-        if (Object.prototype.hasOwnProperty.call(h, k) && String(k).toLowerCase() === name) {
-          return String(h[k]);
-        }
-      }
-    }
-    return "";
-  }
   function mergeHeaders(a, b) {
     var out = new Headers();
     function add(src) {
@@ -83,19 +66,13 @@ pub const INJECT_JS: &str = r#"(function(){
   function isStudioAgui(pathname) {
     return pathname === "/api/studio/ag-ui";
   }
-  function wantsEventStream(init, req) {
-    var a = "";
-    if (init) a = headerOf(init.headers, "accept");
-    if (!a && req) a = headerOf(req.headers, "accept");
-    return String(a).toLowerCase().indexOf("text/event-stream") >= 0;
-  }
   function isGetRunSse(url, init, req) {
     var method = (init && init.method) || (req && req.method) || "GET";
     if (String(method).toUpperCase() !== "GET") return false;
     try {
       var parsed = new URL(url, location.href);
       if (isStudioAgui(parsed.pathname)) return false;
-      return wantsEventStream(init, req) || isRunSsePath(parsed.pathname);
+      return isRunSsePath(parsed.pathname);
     } catch (e) {
       return false;
     }
@@ -188,10 +165,11 @@ pub fn is_chat_run_sse_path(path_and_query: &str) -> bool {
     rest.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
 }
 
-/// Mirrors the inject `window.fetch` patch: rewrite GET event-stream or GET
-/// `/api/runs/{uuid}` to [`STUDIO_AGUI_PATH`]. POST `/api/agent/*` is never
-/// classified as the AG-UI stream (JSON 202).
-pub fn inject_rewrites_fetch(method: &str, url: &str, accept: Option<&str>) -> bool {
+/// Mirrors the inject `window.fetch` patch: rewrite only GET `/api/runs/{uuid}`
+/// to [`STUDIO_AGUI_PATH`]. The decision is method + path; the Accept header
+/// plays no part, so other Chat SSE stays on the SSO proxy. POST `/api/agent/*`
+/// is never classified as the AG-UI stream (JSON 202).
+pub fn inject_rewrites_fetch(method: &str, url: &str) -> bool {
     if !method.eq_ignore_ascii_case("GET") {
         return false;
     }
@@ -200,11 +178,7 @@ pub fn inject_rewrites_fetch(method: &str, url: &str, accept: Option<&str>) -> b
     if path_only == STUDIO_AGUI_PATH || path_only.starts_with(&format!("{STUDIO_AGUI_PATH}/")) {
         return false;
     }
-    let wants_sse = accept
-        .unwrap_or("")
-        .to_ascii_lowercase()
-        .contains("text/event-stream");
-    wants_sse || is_chat_run_sse_path(&path)
+    is_chat_run_sse_path(&path)
 }
 
 fn fetch_url_path_and_query(url: &str) -> String {
@@ -358,13 +332,20 @@ mod tests {
         assert!(INJECT_JS.contains("__STUDIO_AGUI_INJECT__"));
         assert!(INJECT_JS.contains("window.fetch"));
         assert!(INJECT_JS.contains("X-Studio-Agui-Url"));
-        assert!(INJECT_JS.contains("text/event-stream"));
         assert!(INJECT_JS.contains("isRunSsePath"));
         assert!(INJECT_JS.contains("isGetRunSse"));
+        assert!(INJECT_JS.contains("return isRunSsePath(parsed.pathname);"));
         assert!(INJECT_JS.contains("?to="));
         assert!(INJECT_JS.contains("encodeURIComponent"));
         assert!(INJECT_JS.contains("api\\/runs\\/"));
         assert!(INJECT_JS.contains("toUpperCase() !== \"GET\""));
+        assert!(
+            !INJECT_JS.contains("wantsEventStream(init, req) ||"),
+            "Accept: text/event-stream alone must not redirect other Chat SSE to the streamer"
+        );
+        assert!(!INJECT_JS.contains("wantsEventStream"));
+        assert!(!INJECT_JS.contains("headerOf"));
+        assert!(!INJECT_JS.contains("text/event-stream"));
         assert!(!INJECT_JS.contains("isAbsoluteRunSse"));
         assert!(!INJECT_JS.contains("EventSource"));
         assert!(!INJECT_JS.contains("vnd.ag-ui"));
@@ -427,47 +408,54 @@ mod tests {
     fn fetch_get_runs_sse_is_rewritten_post_agent_is_not() {
         let run = "/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7?since=0";
         assert!(
-            inject_rewrites_fetch("GET", run, Some("text/event-stream")),
-            "production Chat: fetch GET /api/runs SSE"
+            inject_rewrites_fetch("GET", run),
+            "production Chat: fetch GET /api/runs SSE (with ?since= preserved)"
         );
         assert!(
-            inject_rewrites_fetch("GET", run, None),
-            "GET /api/runs/{{uuid}} is the run stream even without Accept"
+            inject_rewrites_fetch("GET", "/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7"),
+            "GET /api/runs/{{uuid}} is the run stream regardless of Accept"
+        );
+        assert!(
+            inject_rewrites_fetch("get", run),
+            "method comparison is case-insensitive like the JS toUpperCase()"
         );
         assert!(inject_rewrites_fetch(
             "GET",
-            "https://chat.mcpwork.space/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7?since=0",
-            Some("text/event-stream")
+            "https://chat.mcpwork.space/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7?since=0"
         ));
-        assert!(inject_rewrites_fetch(
-            "GET",
-            "/api/threads/1de8f6f0-b0c5-4903-8a7b-15aaae852f62/runs",
-            Some("text/event-stream")
+        assert!(
+            !inject_rewrites_fetch(
+                "GET",
+                "/api/threads/1de8f6f0-b0c5-4903-8a7b-15aaae852f62/runs"
+            ),
+            "other Chat SSE stays on the SSO proxy: Accept: text/event-stream alone \
+             must not redirect it to the streamer, which only forwards /api/runs/{{uuid}}"
+        );
+        assert!(!inject_rewrites_fetch("GET", "/api/threads"));
+        assert!(!inject_rewrites_fetch("POST", "/api/agent/game"));
+        assert!(!inject_rewrites_fetch(
+            "POST",
+            "/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7"
         ));
         assert!(!inject_rewrites_fetch(
             "POST",
-            "/api/agent/game",
-            Some("text/event-stream")
-        ));
-        assert!(!inject_rewrites_fetch(
-            "POST",
-            "/api/agent/game",
-            Some("application/json")
-        ));
-        assert!(!inject_rewrites_fetch(
-            "POST",
-            "/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7/cancel",
-            Some("application/json")
+            "/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7/cancel"
         ));
         assert!(!inject_rewrites_fetch(
             "GET",
-            "/api/studio/ag-ui?to=/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7?since=0",
-            Some("text/event-stream")
+            "/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7/cancel"
         ));
         assert!(!inject_rewrites_fetch(
             "GET",
-            "/api/threads/1de8f6f0-b0c5-4903-8a7b-15aaae852f62/runs",
-            Some("application/json")
+            "/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7/scouts/abc"
+        ));
+        assert!(!inject_rewrites_fetch(
+            "GET",
+            "/api/studio/ag-ui?to=/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7?since=0"
+        ));
+        assert!(!inject_rewrites_fetch(
+            "GET",
+            "https://chat.mcpwork.space/api/studio/ag-ui?to=/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7"
         ));
     }
 

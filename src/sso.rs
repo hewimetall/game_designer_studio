@@ -1081,9 +1081,12 @@ mod tests {
         assert!(AGUI_INJECT_JS.contains("__STUDIO_AGUI_INJECT__"));
         assert!(AGUI_INJECT_JS.contains("/api/studio/ag-ui"));
         assert!(AGUI_INJECT_JS.contains("X-Studio-Agui-Url"));
-        assert!(AGUI_INJECT_JS.contains("text/event-stream"));
         assert!(AGUI_INJECT_JS.contains("api\\/runs\\/"));
         assert!(AGUI_INJECT_JS.contains("isGetRunSse"));
+        assert!(
+            !AGUI_INJECT_JS.contains("wantsEventStream"),
+            "only GET /api/runs/{{uuid}} is rewritten; Accept alone never is"
+        );
         assert!(!AGUI_INJECT_JS.contains("isAbsoluteRunSse"));
         assert!(!AGUI_INJECT_JS.contains("EventSource"));
         assert!(!AGUI_INJECT_JS.contains("vnd.ag-ui"));
