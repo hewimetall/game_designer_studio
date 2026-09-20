@@ -1,6 +1,6 @@
 [package]
 name = "designer_studio"
-version = "0.1.0"
+version = "0.1.2"
 edition = "2021"
 rust-version = "1.95"
 description = "Local Tauri desk: chrome + Authentik cookie proxy to the live stand (Level / Sprites / Bestiary) and system SSO apps (Chat / S3)"
