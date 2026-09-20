@@ -1,0 +1,37 @@
+[package]
+name = "designer_studio"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+description = "Local Tauri desk: chrome + Authentik cookie proxy to the live stand (Level / Sprites / Bestiary)"
+repository = "https://github.com/hewimetall/game_designer_studio"
+homepage = "https://github.com/hewimetall/game_designer_studio/releases"
+
+[[bin]]
+name = "designer_studio"
+path = "src/main.rs"
+
+# cdylib cannot share the bin name on Windows (Tauri 2 Android needs both).
+[lib]
+name = "designer_studio_lib"
+path = "src/lib.rs"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+# Versions are pinned (not `{ workspace = true }`) so this crate is a valid
+# standalone root of public hewimetall/game_designer_studio. Private
+# hewimetall/game can later submodule that URL at crates/designer_studio.
+[dependencies]
+axum = "0.8"
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "cookies", "http2", "gzip", "charset"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+rust-embed = "8"
+tauri = { version = "2", features = [] }
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.6", features = ["cors", "fs"] }

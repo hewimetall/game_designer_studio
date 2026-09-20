@@ -1,0 +1,295 @@
+# Public-repo packaging for hewimetall/game_designer_studio.
+# GitHub does not run this file while it lives under
+# crates/designer_studio/.github/ in private hewimetall/game.
+# After split_designer_studio_subrepo.sh (crate flattened to repo root) this
+# becomes .github/workflows/release.yml.
+#
+# Standard GitHub-hosted runners are free on public repositories. Private game
+# must not run Windows/Android packaging (Actions spending limit $0).
+#
+# Primary distribution: GitHub Releases (NSIS + APK). Not NuGet. Not an npm installer.
+# webviewInstallMode remains skip — designers install Evergreen Bootstrapper themselves.
+# Chrome only: no src/web, no hashed editor SPAs. No Authentik secrets.
+# No Game, no A-Life, no tool_server, no Bevy.
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+concurrency:
+  group: designer-studio-release-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  TAURI_CLI_VERSION: "2.11.5"
+
+jobs:
+  package:
+    name: ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # GitHub has no windows-11 x64 hosted label (only windows-11-arm).
+          - target: windows-11
+            os: windows-latest
+          - target: android
+            os: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95
+          targets: ${{ matrix.target == 'android' && 'aarch64-linux-android' || '' }}
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: studio-${{ matrix.target }}-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
+          restore-keys: |
+            studio-${{ matrix.target }}-
+
+      - name: cache tauri-cli
+        id: cache-tauri-cli
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/cargo-tauri
+            ~/.cargo/bin/cargo-tauri.exe
+          key: cargo-tauri-cli-${{ env.TAURI_CLI_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+
+      - name: install tauri-cli
+        if: steps.cache-tauri-cli.outputs.cache-hit != 'true'
+        shell: bash
+        env:
+          TAURI_CLI_VERSION: ${{ env.TAURI_CLI_VERSION }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${HOME}/.cargo/bin"
+          case "${RUNNER_OS}" in
+            Windows) asset="cargo-tauri-x86_64-pc-windows-msvc.zip" ;;
+            Linux) asset="cargo-tauri-x86_64-unknown-linux-gnu.tgz" ;;
+            *) echo "unsupported RUNNER_OS=${RUNNER_OS}"; exit 1 ;;
+          esac
+          tmp="${RUNNER_TEMP}/cargo-tauri-install"
+          mkdir -p "$tmp"
+          curl -fsSL "https://github.com/tauri-apps/tauri/releases/download/tauri-cli-v${TAURI_CLI_VERSION}/${asset}" \
+            -o "$tmp/${asset}"
+          python3 - "$tmp" "$asset" "${HOME}/.cargo/bin" <<'PY'
+          import os, sys, tarfile, zipfile, shutil
+          tmp, asset, dest_dir = sys.argv[1], sys.argv[2], sys.argv[3]
+          src = os.path.join(tmp, asset)
+          out = os.path.join(tmp, "out")
+          os.makedirs(out, exist_ok=True)
+          os.makedirs(dest_dir, exist_ok=True)
+          if asset.endswith(".zip"):
+              with zipfile.ZipFile(src) as z:
+                  z.extractall(out)
+          else:
+              with tarfile.open(src, "r:gz") as t:
+                  t.extractall(out)
+          bins = []
+          for root, _dirs, files in os.walk(out):
+              for name in files:
+                  if name.startswith("cargo-tauri"):
+                      bins.append(os.path.join(root, name))
+          if not bins:
+              raise SystemExit(f"no cargo-tauri binary in {asset}")
+          src_bin = bins[0]
+          dest = os.path.join(dest_dir, os.basename(src_bin))
+          shutil.copy2(src_bin, dest)
+          os.chmod(dest, 0o755)
+          print("installed", dest)
+          PY
+          cargo tauri --version
+
+      - name: chrome only — no hashed editor SPAs
+        shell: bash
+        run: |
+          test -f ui/index.html
+          if [[ -d src/web ]]; then
+            echo "src/web must not ship in the public chrome-only tree" >&2
+            exit 1
+          fi
+          if find ui/level ui/sprites ui/bestiary -type f \( -name '*.js' -o -name 'index-*.css' \) 2>/dev/null | grep -q .; then
+            echo "hashed editor SPA leaked into ui/" >&2
+            exit 1
+          fi
+
+      - name: Set up JDK
+        if: matrix.target == 'android'
+        uses: actions/setup-java@v4
+        with:
+          java-version: "21"
+          distribution: temurin
+
+      - name: Setup Android SDK
+        if: matrix.target == 'android'
+        uses: android-actions/setup-android@v4
+
+      - name: Setup Android NDK
+        if: matrix.target == 'android'
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r29
+          link-to-sdk: true
+
+      - name: export Android NDK
+        if: matrix.target == 'android'
+        run: |
+          echo "NDK_HOME=${{ steps.setup-ndk.outputs.ndk-path }}" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=${{ steps.setup-ndk.outputs.ndk-path }}" >> "$GITHUB_ENV"
+
+      - name: install Linux Tauri dependencies
+        if: matrix.target == 'android'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config \
+            libglib2.0-dev \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev
+
+      - name: require Tauri bundle icons
+        shell: bash
+        run: |
+          test -s icons/icon.png
+          test -s icons/32x32.png
+          test -s icons/128x128.png
+          test -s icons/128x128@2x.png
+          test -s icons/icon.ico
+
+      - name: build Windows NSIS (WebView2 skip)
+        if: matrix.target == 'windows-11'
+        run: cargo tauri build --ci --config tauri.ci.conf.json --bundles nsis
+
+      - name: init Android Studio project
+        if: matrix.target == 'android'
+        run: cargo tauri android init --ci
+
+      - name: allow loopback HTTP for Axum chrome (WebView)
+        if: matrix.target == 'android'
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          root = Path("gen/android")
+          manifest = root / "app/src/main/AndroidManifest.xml"
+          text = manifest.read_text(encoding="utf-8")
+          text = text.replace(
+              'android:usesCleartextTraffic="${usesCleartextTraffic}"',
+              'android:usesCleartextTraffic="true"',
+          )
+          text = text.replace(
+              'android:usesCleartextTraffic="false"',
+              'android:usesCleartextTraffic="true"',
+          )
+          if "network_security_config" not in text:
+              text = text.replace(
+                  "<application",
+                  '<application android:networkSecurityConfig="@xml/network_security_config"',
+                  1,
+              )
+          if "android.permission.INTERNET" not in text:
+              needle = "<application"
+              idx = text.find(needle)
+              if idx == -1:
+                  raise SystemExit("AndroidManifest.xml missing <application>")
+              perm = '    <uses-permission android:name="android.permission.INTERNET" />\n    '
+              text = text[:idx] + perm + text[idx:]
+          manifest.write_text(text, encoding="utf-8")
+
+          xml_dir = root / "app/src/main/res/xml"
+          xml_dir.mkdir(parents=True, exist_ok=True)
+          src = Path("android/network_security_config.xml")
+          (xml_dir / "network_security_config.xml").write_bytes(src.read_bytes())
+          print("patched", manifest)
+          PY
+
+      - name: build Android APK (unsigned, no keystore)
+        if: matrix.target == 'android'
+        run: cargo tauri android build --ci --apk --target aarch64
+
+      - name: upload Windows artifacts
+        if: matrix.target == 'windows-11'
+        uses: actions/upload-artifact@v4
+        with:
+          name: designer-studio-windows-11
+          path: |
+            target/release/designer_studio.exe
+            target/release/bundle/nsis/*.exe
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: upload Android artifacts
+        if: matrix.target == 'android'
+        uses: actions/upload-artifact@v4
+        with:
+          name: designer-studio-android
+          path: |
+            gen/android/app/build/outputs/apk/**/*.apk
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: github-release
+    needs: package
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: upload Release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mapfile -t files < <(find dist -type f | sort)
+          if [[ ${#files[@]} -eq 0 ]]; then
+            echo "no artifacts to attach" >&2
+            exit 1
+          fi
+          notes="$(cat <<'EOF'
+          Designer Studio chrome for METRO-ARK (Level / Sprites / Bestiary from the live stand). No Game, no A-Life.
+
+          **Windows:** NSIS `.exe` does not embed WebView2 (`webviewInstallMode: skip`).
+          If the window does not open, install the Evergreen Bootstrapper (left card):
+          https://developer.microsoft.com/microsoft-edge/webview2/
+
+          **Android:** unsigned APK (sideload). Not Play-signed.
+
+          1. Download this Release.
+          2. WebView2 Evergreen Bootstrapper if there is no window.
+          3. Stand slug + Authentik.
+
+          Editors are not inside the installer — they load from https://my.mcpwork.space/stand/<slug>/ after login.
+          EOF
+          )"
+          tag="${GITHUB_REF_NAME}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" "${files[@]}" --clobber
+          else
+            gh release create "$tag" "${files[@]}" \
+              --title "$tag" \
+              --notes "$notes"
+          fi

@@ -1,0 +1,726 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>METRO-ARK Studio</title>
+    <style>
+      :root {
+        --concrete: #161412;
+        --ticket: #e8d5a8;
+        --sodium: #e4a227;
+        --rust: #9a3b1c;
+        --ink: #1b140e;
+        --mute: #8a7a62;
+        --offline: #c4452a;
+        --ticket-h: 32px;
+      }
+      * { box-sizing: border-box; }
+      html, body {
+        margin: 0;
+        height: 100%;
+        background: var(--concrete);
+        color: var(--ticket);
+        font-family: "Bahnschrift", "DIN Alternate", "Segoe UI", "SF Pro Text", "DejaVu Sans", "Noto Sans", sans-serif;
+      }
+      body { display: flex; flex-direction: column; min-height: 100dvh; }
+      /* One short row under the native title. Old stacked 44px cells ate the desk. */
+      .ticket {
+        display: flex;
+        flex-wrap: nowrap;
+        align-items: center;
+        gap: 8px;
+        height: calc(var(--ticket-h) + env(safe-area-inset-top));
+        min-height: var(--ticket-h);
+        padding: 0 8px;
+        padding-top: env(safe-area-inset-top);
+        border-bottom: 2px solid var(--sodium);
+        font-size: 11px;
+        line-height: 1.15;
+      }
+      .brand {
+        display: flex;
+        align-items: baseline;
+        gap: 6px;
+        flex: 0 0 auto;
+        min-width: 0;
+      }
+      .brand strong { letter-spacing: 0.16em; font-size: 11px; }
+      .brand .lede { display: none; }
+      .who {
+        color: var(--mute);
+        font-size: 10px;
+        letter-spacing: 0.04em;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        max-width: 18ch;
+      }
+      .stations {
+        display: flex;
+        gap: 4px;
+        flex: 0 0 auto;
+      }
+      .station, button, input {
+        font: inherit;
+        color: var(--ticket);
+        background: transparent;
+        border: 1px dashed var(--ticket);
+      }
+      .station, .ops button {
+        min-height: 26px;
+        min-width: 0;
+        padding: 2px 8px;
+        cursor: pointer;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        font-size: 11px;
+      }
+      .station[aria-current="page"], button.primary {
+        background: var(--sodium);
+        color: var(--ink);
+        border-style: solid;
+      }
+      .station:focus-visible, button:focus-visible, input:focus-visible {
+        outline: 2px solid var(--sodium);
+        outline-offset: 2px;
+      }
+      .xfer-rail {
+        flex: 1 1 auto;
+        min-width: 10ch;
+        overflow: hidden;
+        white-space: nowrap;
+        text-overflow: ellipsis;
+        color: var(--sodium);
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        font-size: 11px;
+      }
+      .xfer-rail[data-phase="done"] { color: var(--ticket); }
+      .xfer-rail[data-phase="error"] { color: #ffb4a8; }
+      .ops {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+        flex: 0 0 auto;
+        margin-left: auto;
+      }
+      .mode {
+        min-height: 26px;
+        display: flex;
+        align-items: center;
+        padding: 0 6px;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+        border: 1px solid var(--sodium);
+        font-size: 10px;
+      }
+      .mode[data-offline="true"] {
+        background: var(--offline);
+        color: #fff;
+        border-color: var(--offline);
+      }
+      .desks {
+        flex: 1;
+        display: flex;
+        min-height: 0;
+        position: relative;
+      }
+      .desks iframe {
+        flex: 1;
+        width: 100%;
+        border: 0;
+        background: #0c0b09;
+        min-height: 0;
+      }
+      .gate {
+        flex: 1;
+        display: grid;
+        place-items: center;
+        padding: 24px;
+      }
+      form {
+        width: min(420px, 100%);
+        display: grid;
+        gap: 10px;
+      }
+      label { font-size: 13px; letter-spacing: 0.06em; }
+      .gate button, .gate input {
+        min-height: 44px;
+        padding: 8px 10px;
+      }
+      .gate button {
+        cursor: pointer;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+      .gate input { width: 100%; }
+      .err {
+        margin: 0;
+        padding: 4px 8px;
+        color: #ffb4a8;
+        font-size: 11px;
+        background: #2a1410;
+        border-bottom: 1px solid var(--offline);
+      }
+      .note { color: var(--mute); font-size: 13px; }
+      /* Full pane under the ticket — not a bottom stub. Idle hides both rail + card. */
+      .xfer {
+        position: fixed;
+        top: calc(var(--ticket-h) + env(safe-area-inset-top));
+        left: 0;
+        right: 0;
+        bottom: 0;
+        z-index: 40;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        pointer-events: none;
+        background: rgba(12, 11, 9, 0.78);
+      }
+      .xfer-card {
+        width: min(560px, calc(100vw - 32px));
+        background: var(--ink);
+        color: var(--ticket);
+        border: 2px solid var(--sodium);
+        box-shadow: 0 0 0 1px #000, 0 18px 48px rgba(0, 0, 0, 0.55);
+        padding: 22px 24px 20px;
+      }
+      .xfer-top {
+        display: flex;
+        justify-content: space-between;
+        align-items: baseline;
+        gap: 12px;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+        font-size: 22px;
+        line-height: 1.2;
+      }
+      .xfer-label { color: var(--sodium); }
+      .xfer-path {
+        margin: 10px 0 0;
+        color: var(--mute);
+        font-size: 14px;
+        letter-spacing: 0.04em;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .xfer-bar {
+        margin-top: 14px;
+        height: 6px;
+        background: #2a241c;
+        overflow: hidden;
+      }
+      .xfer-bar > span {
+        display: block;
+        height: 100%;
+        width: 0%;
+        background: var(--sodium);
+      }
+      .xfer[data-phase="done"] .xfer-label { color: var(--ticket); }
+      .xfer[data-phase="error"] .xfer-label { color: #ffb4a8; }
+      .xfer[data-phase="tab"] .xfer-label { color: var(--sodium); }
+      /* .gate { display:grid } and .desks { display:flex } must not win after login. */
+      [hidden] { display: none !important; }
+      @media (max-width: 720px) {
+        .ticket { gap: 6px; }
+        .xfer-top { font-size: 16px; }
+        .who { max-width: 12ch; }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        * { transition: none !important; }
+      }
+    </style>
+  </head>
+  <body>
+    <header class="ticket">
+      <div class="brand" title="локальный стол · стенд · без Game и A-Life">
+        <strong>METRO-ARK</strong>
+        <span class="lede">локальный стол · стенд · без Game и A-Life</span>
+        <span class="who" id="who" hidden></span>
+      </div>
+      <nav class="stations" id="stations" hidden></nav>
+      <div class="xfer-rail" id="xferRail" hidden data-phase="idle">Загрузка</div>
+      <div class="ops">
+        <div class="mode" id="mode" data-offline="true">ОФФЛАЙН</div>
+        <button type="button" id="sync" hidden>Синхронизировать</button>
+        <button type="button" id="out" hidden>Выйти</button>
+      </div>
+    </header>
+    <p class="err" id="err" role="alert" hidden></p>
+    <main class="gate" id="gate">
+      <form id="login">
+        <p class="note">Тот же вход, что на <code>auth.mcpwork.space</code>: identification → password → TOTP. Cookie jar в приложении (официальный Flow Executor), не в WebView.</p>
+        <label>Стенд (slug)<input name="slug" required autocomplete="username" placeholder="neweditor" /></label>
+        <label>Логин<input name="username" required autocomplete="username" /></label>
+        <label>Пароль<input name="password" type="password" required autocomplete="current-password" /></label>
+        <label>TOTP, если есть<input name="totp" inputmode="numeric" autocomplete="one-time-code" /></label>
+        <button class="primary" type="submit">Войти</button>
+      </form>
+    </main>
+    <div class="desks" id="desks" hidden></div>
+    <aside id="xfer" class="xfer" hidden role="status" aria-live="polite" data-phase="idle">
+      <div class="xfer-card">
+        <div class="xfer-top">
+          <strong class="xfer-label" id="xferLabel">Загрузка</strong>
+          <span id="xferCount"></span>
+        </div>
+        <p class="xfer-path" id="xferPath"></p>
+        <div class="xfer-bar" id="xferBarWrap" hidden><span id="xferBar"></span></div>
+      </div>
+    </aside>
+    <script>
+      const mode = document.getElementById("mode");
+      const sync = document.getElementById("sync");
+      const out = document.getElementById("out");
+      const stations = document.getElementById("stations");
+      const gate = document.getElementById("gate");
+      const desks = document.getElementById("desks");
+      const err = document.getElementById("err");
+      const who = document.getElementById("who");
+      const frames = new Map();
+      let slug = "";
+      const xfer = document.getElementById("xfer");
+      const xferRail = document.getElementById("xferRail");
+      const xferLabel = document.getElementById("xferLabel");
+      const xferCount = document.getElementById("xferCount");
+      const xferPath = document.getElementById("xferPath");
+      const xferBarWrap = document.getElementById("xferBarWrap");
+      const xferBar = document.getElementById("xferBar");
+      let xferHideTimer = 0;
+      let xferDismissedDone = false;
+      let rustSnap = null;
+      let rustBusy = false;
+      let tabLoad = null;
+      let tabHideTimer = 0;
+
+      function ruBytes(n) {
+        if (!n) return "0 Б";
+        if (n < 1024) return n + " Б";
+        const kb = n / 1024;
+        if (kb < 1024) return (kb >= 10 ? kb.toFixed(0) : kb.toFixed(1)) + " КБ";
+        return (n / (1024 * 1024)).toFixed(1) + " МБ";
+      }
+
+      function fileName(path) {
+        if (!path) return "";
+        const parts = String(path).split("/").filter(Boolean);
+        return parts.length ? parts[parts.length - 1] : path;
+      }
+
+      function hideXfer() {
+        xfer.hidden = true;
+        xferRail.hidden = true;
+      }
+
+      function paintXfer(p) {
+        if (!p || !p.phase || p.phase === "idle") {
+          hideXfer();
+          return;
+        }
+        xfer.hidden = false;
+        xferRail.hidden = false;
+        xfer.dataset.phase = p.phase;
+        xferRail.dataset.phase = p.phase;
+        const files = p.files_total > 0 ? p.files_done + "/" + p.files_total : String(p.files_done || 0);
+        const size = ruBytes(p.bytes_done || 0);
+        const name = p.error || fileName(p.path) || "";
+        let headline;
+        let rail;
+        if (p.phase === "tab") {
+          headline = "Вкладка · " + (name || "index/solid/App");
+          rail = headline;
+          xferCount.textContent = tabLoad && tabLoad.label ? tabLoad.label : "";
+          xferPath.textContent = name || "index/solid/App";
+          xferBarWrap.hidden = true;
+        } else if (p.phase === "done") {
+          headline = "Готово";
+          rail = "Готово · " + files + " · " + size;
+          xferCount.textContent = files + " · " + size;
+          xferPath.textContent = name;
+        } else if (p.phase === "error") {
+          headline = "Сбой";
+          rail = "Сбой · " + files + " · " + size;
+          xferCount.textContent = files + " · " + size;
+          xferPath.textContent = name;
+        } else {
+          headline = "ЗАГРУЗКА " + files + " · " + size;
+          rail = name ? headline + " · " + name : headline;
+          xferCount.textContent = "";
+          xferPath.textContent = name;
+        }
+        xferLabel.textContent = headline;
+        xferRail.textContent = rail;
+        if (p.phase !== "tab") {
+          const frac = p.bytes_total > 0
+            ? Math.min(1, (p.bytes_done || 0) / p.bytes_total)
+            : (p.files_total > 0 ? Math.min(1, (p.files_done || 0) / p.files_total) : null);
+          if (frac == null) {
+            xferBarWrap.hidden = true;
+          } else {
+            xferBarWrap.hidden = false;
+            xferBar.style.width = Math.round(frac * 100) + "%";
+          }
+        }
+      }
+
+      function paintFromState() {
+        if (rustBusy && rustSnap) {
+          paintXfer(rustSnap);
+          return;
+        }
+        if (tabLoad) {
+          paintXfer({
+            phase: "tab",
+            files_done: 0,
+            files_total: 0,
+            bytes_done: 0,
+            path: tabLoad.hint || "index/solid/App",
+            error: null
+          });
+          return;
+        }
+        if (rustSnap && (rustSnap.phase === "done" || rustSnap.phase === "error") && !xferDismissedDone) {
+          paintXfer(rustSnap);
+          return;
+        }
+        hideXfer();
+      }
+
+      function applyProgress(p) {
+        if (!p || !p.phase) return;
+        rustSnap = p;
+        const busy = p.phase === "overlay" || p.phase === "sync";
+        rustBusy = busy;
+        if (busy) {
+          xferDismissedDone = false;
+          if (xferHideTimer) {
+            clearTimeout(xferHideTimer);
+            xferHideTimer = 0;
+          }
+        }
+        if (p.phase === "idle") {
+          rustBusy = false;
+          paintFromState();
+          return;
+        }
+        paintFromState();
+        if ((p.phase === "done" || p.phase === "error") && !xferHideTimer && !xferDismissedDone) {
+          xferHideTimer = setTimeout(() => {
+            xferDismissedDone = true;
+            xferHideTimer = 0;
+            rustBusy = false;
+            paintFromState();
+          }, 1400);
+        }
+      }
+
+      function showTabLoad(tab) {
+        tabLoad = { label: tab.label || tab.id, hint: "index/solid/App" };
+        if (tabHideTimer) {
+          clearTimeout(tabHideTimer);
+          tabHideTimer = 0;
+        }
+        paintFromState();
+      }
+
+      function hideTabLoadSoon() {
+        if (tabHideTimer) clearTimeout(tabHideTimer);
+        tabHideTimer = setTimeout(() => {
+          tabLoad = null;
+          tabHideTimer = 0;
+          paintFromState();
+        }, 700);
+      }
+
+      async function pollProgress() {
+        try {
+          applyProgress(await (await fetch("/api/studio/progress")).json());
+        } catch (_e) {}
+      }
+
+      function isTauriWebview() {
+        try {
+          return !!(window.__TAURI__ || window.__TAURI_INTERNALS__);
+        } catch (_e) {
+          return false;
+        }
+      }
+
+      function onStudioProgress(event) {
+        applyProgress((event && event.payload) || event);
+      }
+      window.applyStudioProgress = applyProgress;
+
+      function listenStudioProgress() {
+        try {
+          const api = window.__TAURI__;
+          if (api && api.event && typeof api.event.listen === "function") {
+            api.event.listen("studio-progress", onStudioProgress);
+            return true;
+          }
+          if (api && typeof api.listen === "function") {
+            api.listen("studio-progress", onStudioProgress);
+            return true;
+          }
+          const internals = window.__TAURI_INTERNALS__;
+          if (
+            internals &&
+            typeof internals.invoke === "function" &&
+            typeof internals.transformCallback === "function"
+          ) {
+            const id = internals.transformCallback(onStudioProgress);
+            internals.invoke("plugin:event|listen", {
+              event: "studio-progress",
+              target: { kind: "Any" },
+              handler: id
+            });
+            return true;
+          }
+        } catch (_e) {}
+        return false;
+      }
+
+      function startProgressFeed() {
+        // Native Tauri window: events only. Chromium / --no-window: HTTP poll.
+        if (isTauriWebview()) {
+          if (listenStudioProgress()) return;
+          let tries = 0;
+          const retry = setInterval(() => {
+            tries += 1;
+            if (listenStudioProgress() || tries > 40) clearInterval(retry);
+          }, 50);
+          return;
+        }
+        pollProgress();
+        setInterval(pollProgress, 250);
+      }
+
+      function showErr(text) {
+        err.textContent = text || "";
+        err.hidden = !text;
+      }
+
+      function paintMode(data) {
+        const offline = !data.online;
+        mode.dataset.offline = String(offline);
+        mode.textContent = offline ? "ОФФЛАЙН" : "ОНЛАЙН";
+        if (offline) {
+          mode.title = "Стенд недоступен. Можно смотреть кеш. Сохранить нельзя.";
+        } else {
+          mode.title = "Стенд отвечает. Сохранения идут на стенд.";
+        }
+      }
+
+      async function refreshStatus() {
+        const res = await fetch("/api/studio/sync");
+        paintMode(await res.json());
+      }
+
+      function appFromHref(href) {
+        if (!href) return "";
+        try {
+          const url = new URL(href, "http://127.0.0.1/");
+          const parts = url.pathname.split("/").filter(Boolean);
+          const app = parts[0] === "stand" ? parts[2] : parts[0];
+          if (app === "level" || app === "sprites" || app === "bestiary" || app === "game" || app === "alife") {
+            return app;
+          }
+        } catch (_e) {}
+        return "";
+      }
+
+      function isRemoteAppLink(link) {
+        const href = link.getAttribute("href") || link.href || "";
+        const app = appFromHref(href);
+        if (app === "game" || app === "alife") return true;
+        const text = (link.textContent || "").replace(/\s+/g, " ").trim();
+        return /^(game|alife|a-life|alife editor|a-life editor)$/i.test(text);
+      }
+
+      function hideNode(node) {
+        node.hidden = true;
+        node.setAttribute("aria-hidden", "true");
+        if ("tabIndex" in node) node.tabIndex = -1;
+        // Solid rewrites classList after mount; inline !important survives that.
+        if (node.style && node.style.setProperty) {
+          node.style.setProperty("display", "none", "important");
+        }
+      }
+
+      function hideRemoteApps(doc) {
+        if (!doc) return;
+        if (doc.head && !doc.getElementById("studio-hide-remote")) {
+          const style = doc.createElement("style");
+          style.id = "studio-hide-remote";
+          // Desk chrome already has Level / Sprites / Bestiary. Hide the Solid
+          // Navbar (nav.studio-nav) so the iframe does not paint a second menu.
+          // !important + inline hideNode: Solid rewrites classList / display:flex.
+          style.textContent =
+            "nav.studio-nav,.studio-nav," +
+            ".editor-toolbar > nav.studio-nav,.editor-toolbar .studio-nav," +
+            "nav.studio-nav + .toolbar-sep,nav.studio-nav + .toolbar-separator," +
+            ".studio-nav + .toolbar-sep,.studio-nav + .toolbar-separator" +
+            "{display:none!important;height:0!important;min-height:0!important;" +
+            "max-height:0!important;margin:0!important;padding:0!important;" +
+            "border:0!important;overflow:hidden!important}" +
+            "nav.studio-nav a[href*=\"/game\"],nav.studio-nav a[href*=\"/alife\"]," +
+            "nav.studio-nav a[href*=\":5174\"],nav.studio-nav a[href*=\":5176\"]" +
+            "{display:none!important}";
+          doc.head.appendChild(style);
+        }
+        doc.querySelectorAll("nav.studio-nav, .studio-nav").forEach((nav) => {
+          hideNode(nav);
+          const next = nav.nextElementSibling;
+          if (next && next.classList &&
+              (next.classList.contains("toolbar-sep") ||
+               next.classList.contains("toolbar-separator"))) {
+            hideNode(next);
+          }
+        });
+        doc.querySelectorAll("a").forEach((link) => {
+          if (isRemoteAppLink(link)) hideNode(link);
+        });
+        doc.querySelectorAll("iframe").forEach((frame) => {
+          try { hideRemoteApps(frame.contentDocument); } catch (_e) {}
+        });
+      }
+
+      function interceptDeskClicks(doc) {
+        if (!doc || !doc.documentElement || doc.documentElement.dataset.studioClicks) return;
+        doc.documentElement.dataset.studioClicks = "1";
+        doc.addEventListener("click", (event) => {
+          const link = event.target && event.target.closest && event.target.closest("a");
+          if (!link) return;
+          const app = appFromHref(link.getAttribute("href") || link.href || "");
+          if (!app) return;
+          event.preventDefault();
+          event.stopPropagation();
+          if (app === "game" || app === "alife") return;
+          const button = stations.querySelector('.station[data-tab="' + app + '"]');
+          if (button) button.click();
+        }, true);
+      }
+
+      function watchDesk(iframe) {
+        try {
+          const doc = iframe.contentDocument;
+          if (!doc) return;
+          hideRemoteApps(doc);
+          interceptDeskClicks(doc);
+          if (doc.documentElement && !doc.documentElement.dataset.studioWatch) {
+            doc.documentElement.dataset.studioWatch = "1";
+            new MutationObserver(() => hideRemoteApps(doc)).observe(doc.documentElement, {
+              childList: true,
+              subtree: true,
+            });
+          }
+        } catch (_e) {}
+      }
+
+      function openTab(tab, button) {
+        document.querySelectorAll(".station").forEach((el) => {
+          el.setAttribute("aria-current", el === button ? "page" : "false");
+        });
+        frames.forEach((iframe, id) => {
+          iframe.hidden = id !== tab.id;
+        });
+        showTabLoad(tab);
+        let iframe = frames.get(tab.id);
+        if (!iframe) {
+          iframe = document.createElement("iframe");
+          iframe.title = tab.label;
+          iframe.dataset.tab = tab.id;
+          iframe.addEventListener("load", () => {
+            watchDesk(iframe);
+            hideTabLoadSoon();
+          });
+          desks.appendChild(iframe);
+          frames.set(tab.id, iframe);
+          iframe.src = tab.path;
+        } else if (tab.id === "bestiary") {
+          // Sprites save does not notify this desk. Reload so kind→atlas→idle
+          // re-fetches instead of keeping the pre-save in-memory snapshot.
+          iframe.src = tab.path;
+        } else {
+          hideTabLoadSoon();
+        }
+        iframe.hidden = false;
+      }
+
+      async function showDesk(nextSlug, username) {
+        slug = nextSlug;
+        if (username) {
+          who.hidden = false;
+          who.textContent = username + " · " + nextSlug;
+        }
+        const studio = await (await fetch("/api/studio")).json();
+        stations.innerHTML = "";
+        studio.tabs.forEach((tab, i) => {
+          const button = document.createElement("button");
+          button.className = "station";
+          button.type = "button";
+          button.dataset.tab = tab.id;
+          button.textContent = tab.label;
+          button.title = tab.code;
+          const path = "/stand/" + slug + "/" + tab.id + "/";
+          button.addEventListener("click", () => openTab({ id: tab.id, label: tab.label, path }, button));
+          stations.appendChild(button);
+          if (i === 0) openTab({ id: tab.id, label: tab.label, path }, button);
+        });
+        stations.hidden = false;
+        sync.hidden = false;
+        out.hidden = false;
+        gate.hidden = true;
+        desks.hidden = false;
+        await refreshStatus();
+      }
+
+      document.getElementById("login").addEventListener("submit", async (event) => {
+        event.preventDefault();
+        showErr("");
+        const data = Object.fromEntries(new FormData(event.target));
+        const res = await fetch("/api/session/login", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(data),
+        });
+        const json = await res.json();
+        if (!res.ok) {
+          showErr(json.error || "вход не удался");
+          return;
+        }
+        await showDesk(json.slug, json.username);
+      });
+
+      sync.addEventListener("click", async () => {
+        showErr("");
+        const res = await fetch("/api/studio/sync", { method: "POST" });
+        const json = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          showErr(json.error || "синхронизация не удалась");
+          return;
+        }
+        await refreshStatus();
+        const bestiary = frames.get("bestiary");
+        if (bestiary) {
+          bestiary.src = "/stand/" + slug + "/bestiary/";
+        }
+      });
+
+      out.addEventListener("click", async () => {
+        await fetch("/api/session/logout", { method: "POST" });
+        location.reload();
+      });
+
+      setInterval(() => { refreshStatus().catch(() => {}); }, 4000);
+      startProgressFeed();
+
+      fetch("/api/session")
+        .then((r) => r.json())
+        .then((s) => { if (s.authenticated) return showDesk(s.slug, s.username); })
+        .catch(() => {});
+    </script>
+  </body>
+</html>
