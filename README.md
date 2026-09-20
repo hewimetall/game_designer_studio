@@ -33,7 +33,7 @@ You do not need npm, cargo, or a UI packaging script.
 
 This repo is chrome-only. Hashed Vite SPAs under `ui/level`, `ui/sprites`, `ui/bestiary` must not be committed. After login the iframe hits `/stand/<slug>/<app>/` for editors (live slug `cursorgo`); Chat / S3 iframes hit extra `127.0.0.1` ports (same Authentik jar). Axum fills editor overlay from the stand. Solid `apiBasePath()` stays `/stand/<slug>/api`.
 
-Chat injects a marker into Chat HTML only. The live contract is relative `POST /api/agent/{id}` (JSON 202 `{runId}`) then `GET /api/runs/{id}?since=` (`Accept: text/event-stream`). The native Authentik cookie jar streams that GET (`Accept-Encoding: identity`, 15 min). Inject cache is HTML-only; the SSE byte stream is not cached. Absolute chat-origin GET `/api/runs/{uuid}` is rewritten to loopback `GET /api/studio/ag-ui`. WebSocket is unused in production (501).
+Chat injects a marker into Chat HTML only. The live contract is relative `POST /api/agent/{id}` (JSON 202 `{runId}`) then `GET /api/runs/{id}?since=` (`Accept: text/event-stream` via `fetch` + `getReader()`, not EventSource/HttpAgent). Inject rewrites that GET to loopback `GET /api/studio/ag-ui`; the native Authentik cookie jar streams bytes as-is (`Accept-Encoding: identity`, 15 min). Inject cache is HTML-only; the SSE byte stream is not cached. WebSocket is unused in production (501).
 
 Authentik login in this desk is username + password. «Запомнить» encrypts the cookie jar with AES-256-GCM (key in the OS keyring, ciphertext under `cache_dir`). A still-valid Authentik session skips the gate.
 

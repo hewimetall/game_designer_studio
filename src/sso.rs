@@ -1083,7 +1083,8 @@ mod tests {
         assert!(AGUI_INJECT_JS.contains("X-Studio-Agui-Url"));
         assert!(AGUI_INJECT_JS.contains("text/event-stream"));
         assert!(AGUI_INJECT_JS.contains("api\\/runs\\/"));
-        assert!(AGUI_INJECT_JS.contains("isAbsoluteRunSse"));
+        assert!(AGUI_INJECT_JS.contains("isGetRunSse"));
+        assert!(!AGUI_INJECT_JS.contains("isAbsoluteRunSse"));
         assert!(!AGUI_INJECT_JS.contains("EventSource"));
         assert!(!AGUI_INJECT_JS.contains("vnd.ag-ui"));
         assert!(!AGUI_INJECT_JS.contains("HttpAgent"));
@@ -1198,7 +1199,8 @@ mod tests {
             let js_body = js.text().await.unwrap();
             assert!(js_body.contains("window.fetch"));
             assert!(js_body.contains("api\\/runs\\/"));
-            assert!(js_body.contains("isAbsoluteRunSse"));
+            assert!(js_body.contains("isGetRunSse"));
+            assert!(!js_body.contains("isAbsoluteRunSse"));
             assert!(!js_body.contains("EventSource"));
 
             let s3 = client

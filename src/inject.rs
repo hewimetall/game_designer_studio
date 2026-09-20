@@ -3,12 +3,12 @@
 //! Live `chat.mcpwork.space` is a Next.js Longgraph shell. The composer does
 //! `POST /api/agent/{id}` with JSON and gets `202 {"runId","threadId"}`. The
 //! run itself is `GET /api/runs/{uuid}?since=` with `Accept: text/event-stream`,
-//! parsed from `fetch().body` (not `EventSource`, not CopilotKit `HttpAgent`,
-//! not protobuf). Those paths are relative, so the Chat loopback proxy already
-//! sees them. This module only:
-//! - marks Chat HTML with a small script
-//! - redirects **absolute** chat-origin GET `/api/runs/{uuid}` SSE to the
-//!   studio streamer (WebView cookies are a different jar: Tauri #12988)
+//! parsed from `fetch().body.getReader()` (not `EventSource`, not CopilotKit
+//! `HttpAgent`, not protobuf). Relative `/api/runs` already hits the Chat
+//! loopback SSO proxy (`is_chat_run_sse_path`). The inject script still patches
+//! `window.fetch` so GET event-stream / GET `/api/runs/{uuid}` (relative or
+//! absolute) is rewritten to [`STUDIO_AGUI_PATH`] with the native jar. POST
+//! `/api/agent/*` stays JSON through the SSO proxy.
 
 use axum::http::HeaderMap;
 
@@ -23,8 +23,9 @@ pub const STUDIO_INJECT_JS_PATH: &str = "/api/studio/ag-ui-inject.js";
 pub const INJECT_MARKER: &str = "data-studio-agui-inject";
 pub const INJECT_SCRIPT_ID: &str = "studio-agui-inject";
 
-/// Safety-net script: relative `/api/runs/…` stays on the loopback proxy.
-/// Absolute chat-origin GET SSE is rewritten to [`STUDIO_AGUI_PATH`].
+/// Patch `window.fetch`: GET event-stream or GET `/api/runs/{uuid}` → streamer.
+/// POST `/api/agent/*` is not rewritten. Production uses `fetch` + `getReader()`,
+/// not `EventSource`.
 pub const INJECT_JS: &str = r#"(function(){
   if (window.__STUDIO_AGUI_INJECT__) return;
   window.__STUDIO_AGUI_INJECT__ = true;
@@ -77,19 +78,32 @@ pub const INJECT_JS: &str = r#"(function(){
   function isRunSsePath(pathname) {
     return /^\/api\/runs\/[0-9a-fA-F-]+$/.test(pathname);
   }
-  function isAbsoluteRunSse(url, init, req) {
-    var method = (init && init.method) || (req && req.method) || "GET";
-    if (String(method).toUpperCase() !== "GET") return false;
+  function isStudioAgui(pathname) {
+    return pathname === "/api/studio/ag-ui";
+  }
+  function wantsEventStream(init, req) {
     var a = "";
     if (init) a = headerOf(init.headers, "accept");
     if (!a && req) a = headerOf(req.headers, "accept");
-    if (String(a).toLowerCase().indexOf("text/event-stream") < 0) return false;
+    return String(a).toLowerCase().indexOf("text/event-stream") >= 0;
+  }
+  function isGetRunSse(url, init, req) {
+    var method = (init && init.method) || (req && req.method) || "GET";
+    if (String(method).toUpperCase() !== "GET") return false;
     try {
       var parsed = new URL(url, location.href);
-      if (parsed.origin === location.origin) return false;
-      return isRunSsePath(parsed.pathname);
+      if (isStudioAgui(parsed.pathname)) return false;
+      return wantsEventStream(init, req) || isRunSsePath(parsed.pathname);
     } catch (e) {
       return false;
+    }
+  }
+  function studioTo(url) {
+    try {
+      var parsed = new URL(url, location.href);
+      return EP + "?to=" + encodeURIComponent(parsed.pathname + parsed.search);
+    } catch (e) {
+      return EP;
     }
   }
   var origFetch = window.fetch.bind(window);
@@ -104,7 +118,7 @@ pub const INJECT_JS: &str = r#"(function(){
     } else {
       url = String(input);
     }
-    if (!isAbsoluteRunSse(url, init, req)) {
+    if (!isGetRunSse(url, init, req)) {
       return origFetch(input, init);
     }
     var next = {};
@@ -117,12 +131,7 @@ pub const INJECT_JS: &str = r#"(function(){
     next.headers.set("X-Studio-Agui-Url", url);
     next.method = "GET";
     if (req && req.signal && !next.signal) next.signal = req.signal;
-    var dest = EP;
-    try {
-      var parsed = new URL(url, location.href);
-      dest = EP + "?to=" + encodeURIComponent(parsed.pathname + parsed.search);
-    } catch (e) {}
-    return origFetch(dest, next);
+    return origFetch(studioTo(url), next);
   };
 })();"#;
 
@@ -175,6 +184,36 @@ pub fn is_chat_run_sse_path(path_and_query: &str) -> bool {
         return false;
     }
     rest.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
+}
+
+/// Mirrors the inject `window.fetch` patch: rewrite GET event-stream or GET
+/// `/api/runs/{uuid}` to [`STUDIO_AGUI_PATH`]. POST `/api/agent/*` is never
+/// classified as the AG-UI stream (JSON 202).
+pub fn inject_rewrites_fetch(method: &str, url: &str, accept: Option<&str>) -> bool {
+    if !method.eq_ignore_ascii_case("GET") {
+        return false;
+    }
+    let path = fetch_url_path_and_query(url);
+    let path_only = path.split('?').next().unwrap_or(path.as_str());
+    if path_only == STUDIO_AGUI_PATH || path_only.starts_with(&format!("{STUDIO_AGUI_PATH}/")) {
+        return false;
+    }
+    let wants_sse = accept
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .contains("text/event-stream");
+    wants_sse || is_chat_run_sse_path(&path)
+}
+
+fn fetch_url_path_and_query(url: &str) -> String {
+    let url = url.trim();
+    if url.starts_with('/') {
+        return url.to_string();
+    }
+    reqwest::Url::parse(url)
+        .ok()
+        .map(|u| Proxy::path_and_query(u.path(), u.query()))
+        .unwrap_or_else(|| url.to_string())
 }
 
 pub fn agui_upstream_path(
@@ -315,15 +354,21 @@ mod tests {
             1
         );
         assert!(INJECT_JS.contains("__STUDIO_AGUI_INJECT__"));
+        assert!(INJECT_JS.contains("window.fetch"));
         assert!(INJECT_JS.contains("X-Studio-Agui-Url"));
         assert!(INJECT_JS.contains("text/event-stream"));
         assert!(INJECT_JS.contains("isRunSsePath"));
-        assert!(INJECT_JS.contains("isAbsoluteRunSse"));
+        assert!(INJECT_JS.contains("isGetRunSse"));
+        assert!(INJECT_JS.contains("?to="));
+        assert!(INJECT_JS.contains("encodeURIComponent"));
         assert!(INJECT_JS.contains("api\\/runs\\/"));
+        assert!(INJECT_JS.contains("toUpperCase() !== \"GET\""));
+        assert!(!INJECT_JS.contains("isAbsoluteRunSse"));
         assert!(!INJECT_JS.contains("EventSource"));
         assert!(!INJECT_JS.contains("vnd.ag-ui"));
         assert!(!INJECT_JS.contains("HttpAgent"));
         assert!(!INJECT_JS.contains("copilotkit"));
+        assert!(!INJECT_JS.contains("parsed.origin === location.origin"));
     }
 
     #[test]
@@ -377,6 +422,54 @@ mod tests {
     }
 
     #[test]
+    fn fetch_get_runs_sse_is_rewritten_post_agent_is_not() {
+        let run = "/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7?since=0";
+        assert!(
+            inject_rewrites_fetch("GET", run, Some("text/event-stream")),
+            "production Chat: fetch GET /api/runs SSE"
+        );
+        assert!(
+            inject_rewrites_fetch("GET", run, None),
+            "GET /api/runs/{{uuid}} is the run stream even without Accept"
+        );
+        assert!(inject_rewrites_fetch(
+            "GET",
+            "https://chat.mcpwork.space/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7?since=0",
+            Some("text/event-stream")
+        ));
+        assert!(inject_rewrites_fetch(
+            "GET",
+            "/api/threads/1de8f6f0-b0c5-4903-8a7b-15aaae852f62/runs",
+            Some("text/event-stream")
+        ));
+        assert!(!inject_rewrites_fetch(
+            "POST",
+            "/api/agent/game",
+            Some("text/event-stream")
+        ));
+        assert!(!inject_rewrites_fetch(
+            "POST",
+            "/api/agent/game",
+            Some("application/json")
+        ));
+        assert!(!inject_rewrites_fetch(
+            "POST",
+            "/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7/cancel",
+            Some("application/json")
+        ));
+        assert!(!inject_rewrites_fetch(
+            "GET",
+            "/api/studio/ag-ui?to=/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7?since=0",
+            Some("text/event-stream")
+        ));
+        assert!(!inject_rewrites_fetch(
+            "GET",
+            "/api/threads/1de8f6f0-b0c5-4903-8a7b-15aaae852f62/runs",
+            Some("application/json")
+        ));
+    }
+
+    #[test]
     fn streamer_only_forwards_run_sse_on_chat_origin() {
         let origin = "https://chat.mcpwork.space";
         let run = "/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7?since=0";
@@ -409,6 +502,15 @@ mod tests {
             "POST /api/agent is JSON 202, not the SSE streamer"
         );
         assert!(agui_upstream_path(&HeaderMap::new(), Some("to=/agent"), origin).is_none());
+        assert_eq!(
+            agui_upstream_path(
+                &HeaderMap::new(),
+                Some("to=/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7?since=0"),
+                origin
+            )
+            .as_deref(),
+            Some(run)
+        );
         assert!(sanitize_agui_target(STUDIO_AGUI_PATH, origin).is_none());
         assert!(sanitize_agui_target("https://evil.example/x", origin).is_none());
         assert!(sanitize_agui_target("/ok/../secret", origin).is_none());
