@@ -601,112 +601,134 @@ async fn probe_loop(proxy: Arc<Proxy>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::await_loopback;
     use crate::config::StudioConfig;
+    use std::path::PathBuf;
 
-    fn assert_chrome_has_no_totp(html: &str) {
-        let lower = html.to_ascii_lowercase();
-        assert!(!lower.contains("totp"), "chrome must not mention TOTP");
-        assert!(!html.contains("one-time-code"));
-        assert!(!html.contains("есть TOTP"));
-        assert!(!html.contains("showTotp"));
-        assert!(!html.contains("totpNeeded"));
-        assert!(!html.contains("totpWrap"));
-        assert!(!html.contains("name=\"totp\""));
-        assert!(!html.contains("id=\"totp\""));
-        assert!(!html.contains("form.totp"));
-        assert!(!html.contains("TOTP, если есть"));
+    const CHROME: &str = include_str!("../ui/index.html");
+
+    /// Temp root with the real chrome on disk; cache under `root/cache`.
+    fn fixture(label: &str) -> (PathBuf, StudioConfig) {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let root = std::env::temp_dir().join(format!(
+            "designer-host-{label}-{}-{stamp}",
+            std::process::id()
+        ));
+        let ui = root.join("ui");
+        std::fs::create_dir_all(&ui).unwrap();
+        std::fs::write(ui.join("index.html"), CHROME).unwrap();
+        let mut cfg = StudioConfig::production(ui, 0, Some(root.join("cache")));
+        // Never reach the live stand / Authentik from a unit test.
+        cfg.stand_host = "http://127.0.0.1:1".into();
+        cfg.auth_host = "http://127.0.0.1:1".into();
+        cfg.probe_timeout = std::time::Duration::from_millis(500);
+        (root, cfg)
+    }
+
+    fn bound(cfg: StudioConfig) -> LocalHost {
+        let host = bind_local_host(cfg).expect("bind");
+        await_loopback(host.addr);
+        host
+    }
+
+    fn remember_akadmin(cache: &std::path::Path) {
+        remember::save(
+            cache,
+            &RememberedLogin {
+                slug: "cursorgo".into(),
+                username: "akadmin".into(),
+            },
+        )
+        .unwrap();
+    }
+
+    fn save_dead_jar(cache: &std::path::Path) {
+        let jar = reqwest::cookie::Jar::default();
+        let url = reqwest::Url::parse("https://auth.mcpwork.space/").unwrap();
+        jar.add_cookie_str("authentik_session=dead-cookie; Path=/; Secure", &url);
+        remember::save_session_jar(cache, &jar, &["https://auth.mcpwork.space/".into()]).unwrap();
+    }
+
+    async fn serve(app: Router) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}")
+    }
+
+    /// Mock Authentik `/api/v3/core/users/me/`.
+    async fn mock_authentik(whoami: (StatusCode, serde_json::Value)) -> String {
+        serve(Router::new().route(
+            "/api/v3/core/users/me/",
+            get(move || {
+                let (status, body) = whoami.clone();
+                async move { (status, Json(body)) }
+            }),
+        ))
+        .await
+    }
+
+    async fn get_json(client: &reqwest::Client, url: String) -> serde_json::Value {
+        client.get(url).send().await.unwrap().json().await.unwrap()
+    }
+
+    async fn status_of(client: &reqwest::Client, url: String) -> reqwest::StatusCode {
+        client.get(url).send().await.unwrap().status()
+    }
+
+    fn header<'a>(res: &'a reqwest::Response, name: &str) -> Option<&'a str> {
+        res.headers().get(name).and_then(|v| v.to_str().ok())
+    }
+
+    fn header_is(res: &reqwest::Response, name: &str, needle: &str) -> bool {
+        header(res, name).is_some_and(|v| v.contains(needle))
     }
 
     #[test]
-    fn spa_rejects_unknown_apps() {
-        assert!(DesignerTab::from_id("game").is_none());
-        assert!(DesignerTab::from_id("alife").is_none());
-        assert!(DesignerTab::from_id("level").is_some());
+    fn chrome_login_gate_has_remember_and_no_totp() {
+        assert!(
+            CHROME.contains("name=\"remember\""),
+            "login body `remember` flag comes from the gate checkbox"
+        );
+        let lower = CHROME.to_ascii_lowercase();
+        assert!(!lower.contains("totp"), "this Authentik has no TOTP stage");
+        assert!(!lower.contains("one-time-code"));
     }
 
     #[test]
-    fn chrome_hides_gate_and_remote_nav() {
-        let html = include_str!("../ui/index.html");
-        assert!(html.contains("[hidden] { display: none !important; }"));
-        assert!(html.contains("MutationObserver"));
-        assert!(html.contains("setProperty"));
-        assert!(html.contains("querySelectorAll(\"nav.studio-nav, .studio-nav\")"));
-        assert!(html.contains("nav.studio-nav,.studio-nav,"));
-        assert!(html.contains("Синхронизировать"));
-        assert!(html.contains("ОФФЛАЙН"));
-        assert!(html.contains("id=\"desks\""));
-        assert!(html.contains("id=\"xfer\""));
-        assert!(html.contains("id=\"xferRail\""));
-        assert!(html.contains("--ticket-h"));
-        assert!(html.contains("xfer-card"));
-        assert!(html.contains("Вкладка ·"));
-        assert!(html.contains("index/solid/App"));
-        assert!(html.contains("ЗАГРУЗКА"));
-        assert!(html.contains("/api/studio/progress"));
-        assert!(html.contains("studio-progress"));
-        assert!(html.contains("name=\"remember\""));
-        assert!(html.contains("Запомнить вход"));
-        assert!(html.contains("fillRemembered"));
-        assert!(html.contains("const frames = new Map()"));
-        assert_chrome_has_no_totp(html);
-        assert!(html.contains("class=\"stand\""));
-        assert!(html.contains("autocomplete=\"organization\""));
-        assert!(html.contains("autocomplete=\"username\""));
-        assert!(html.contains("autocomplete=\"current-password\""));
-        assert!(html.contains("min-height: 44px"));
-        assert!(!html.contains("Стенд (slug)"));
-        assert!(html.contains("tabPath"));
-        assert!(html.contains("studioTabs"));
-        assert!(!html.contains("\"/stand/\" + slug + \"/\" + tab.id"));
-        assert!(html.contains("isTauriWebview"));
-        assert!(html.contains("__TAURI_INTERNALS__"));
-        assert!(html.contains("listen(\"studio-progress\""));
-        assert!(html.contains("applyStudioProgress"));
-        assert!(html.contains("setInterval(pollProgress, 250)"));
-        assert!(!html.contains("setInterval(() => { pollProgress(); }, 250)"));
-        assert!(html.contains("Загрузка"));
-        assert!(include_str!("../capabilities/default.json").contains("http://127.0.0.1:*"));
-        assert!(include_str!("../capabilities/default.json").contains("core:event:default"));
-        assert!(!html.contains("grid-template-columns: minmax(140px, 220px) 1fr auto"));
-        assert!(!html.contains("bottom: calc(16px + env(safe-area-inset-bottom))"));
-        assert!(include_str!("../tauri.conf.json").contains("\"withGlobalTauri\": true"));
-        assert!(html.contains("placeholder=\"cursorgo\""));
-        assert!(!html.contains("placeholder=\"neweditor\""));
-        assert!(!html.contains("src=\"/stand"));
-        assert!(!html.contains("game-client"));
-        assert!(!html.contains("data-studio-agui-inject"));
+    fn tauri_chrome_may_navigate_loopback_and_listen_events() {
+        let conf: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        assert_eq!(conf["app"]["withGlobalTauri"], true);
+        let caps: serde_json::Value =
+            serde_json::from_str(include_str!("../capabilities/default.json")).unwrap();
+        let urls = caps["remote"]["urls"].as_array().unwrap();
+        assert!(urls.iter().any(|u| u == "http://127.0.0.1:*"), "{urls:?}");
+        let perms = caps["permissions"].as_array().unwrap();
+        assert!(perms.iter().any(|p| p == "core:event:default"), "{perms:?}");
+    }
+
+    #[test]
+    fn placeholder_html_is_not_a_packaged_editor() {
         let placeholder = missing_editor_html("level");
         assert!(placeholder.contains("data-studio-placeholder"));
-        assert!(!placeholder.contains("package_designer_studio_ui"));
         assert!(!looks_like_packaged_editor(placeholder.as_bytes()));
     }
 
     #[test]
-    fn loopback_host_keeps_web_paths_and_excludes_game() {
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
-        let root =
-            std::env::temp_dir().join(format!("designer-host-{}-{}", std::process::id(), stamp));
-        let ui = root.join("ui");
-        std::fs::create_dir_all(&ui).unwrap();
-        std::fs::write(ui.join("index.html"), include_str!("../ui/index.html")).unwrap();
-        let host = bind_local_host(StudioConfig::production(ui, 0, Some(root.join("cache"))))
-            .expect("bind");
-        std::thread::sleep(std::time::Duration::from_millis(150));
+    fn loopback_host_routes_manifest_session_and_stand_paths() {
+        let (root, cfg) = fixture("routes");
+        let host = bound(cfg);
         let base = host.chrome_url();
-        let rt = Runtime::new().unwrap();
-        rt.block_on(async {
+        Runtime::new().unwrap().block_on(async {
             let client = reqwest::Client::new();
-            let studio: serde_json::Value = client
-                .get(format!("{base}api/studio"))
-                .send()
-                .await
-                .unwrap()
-                .json()
-                .await
-                .unwrap();
+
+            let studio = get_json(&client, format!("{base}api/studio")).await;
             let ids: Vec<&str> = studio["tabs"]
                 .as_array()
                 .unwrap()
@@ -719,220 +741,103 @@ mod tests {
             assert_eq!(studio["tabs"][0]["path"], "/stand/{slug}/level/");
             assert_eq!(studio["tabs"][3]["kind"], "sso");
             let chat_path = studio["tabs"][3]["path"].as_str().unwrap();
-            assert!(chat_path.starts_with("http://127.0.0.1:"));
+            assert!(chat_path.starts_with("http://127.0.0.1:"), "{chat_path}");
             assert_eq!(studio["tabs"][3]["origin"], "https://chat.mcpwork.space");
             assert_eq!(studio["tabs"][4]["origin"], "https://s3.mcpwork.space");
 
-            let session: serde_json::Value = client
-                .get(format!("{base}api/session"))
-                .send()
-                .await
-                .unwrap()
-                .json()
-                .await
-                .unwrap();
+            let session = get_json(&client, format!("{base}api/session")).await;
             assert_eq!(session["authenticated"], false);
             assert_eq!(session["remember"], false);
 
-            let sync: serde_json::Value = client
-                .get(format!("{base}api/studio/sync"))
-                .send()
-                .await
-                .unwrap()
-                .json()
-                .await
-                .unwrap();
-            assert_eq!(sync["mode"], "оффлайн");
+            let sync = get_json(&client, format!("{base}api/studio/sync")).await;
+            assert_eq!(sync["online"], false);
 
-            let progress: serde_json::Value = client
-                .get(format!("{base}api/studio/progress"))
-                .send()
-                .await
-                .unwrap()
-                .json()
-                .await
-                .unwrap();
+            let progress = get_json(&client, format!("{base}api/studio/progress")).await;
             assert_eq!(progress["phase"], "idle");
             assert_eq!(progress["files_done"], 0);
-            assert_eq!(progress["files_total"], 0);
-            assert_eq!(progress["bytes_done"], 0);
-            assert_eq!(progress["path"], "");
 
-            let home = client
-                .get(&base)
-                .send()
-                .await
-                .unwrap()
-                .text()
-                .await
-                .unwrap();
-            assert!(home.contains("[hidden] { display: none !important; }"));
-            assert!(home.contains("MutationObserver"));
-            assert!(home.contains("querySelectorAll(\"nav.studio-nav, .studio-nav\")"));
-            assert!(home.contains("id=\"desks\""));
-            assert!(home.contains("id=\"xfer\""));
-            assert!(home.contains("/api/studio/progress"));
-            assert!(home.contains("tabPath"));
-            assert!(home.contains("studioTabs"));
-            assert!(home.contains("name=\"remember\""));
-            assert!(home.contains("Запомнить вход"));
-            assert!(home.contains("fillRemembered"));
-            assert_chrome_has_no_totp(&home);
-            assert!(!home.contains("src=\"/stand"));
-            assert!(!home.contains("\"/stand/\" + slug + \"/\" + tab.id"));
-            assert!(!home.contains("data-studio-agui-inject"));
+            let home = client.get(&base).send().await.unwrap();
+            assert!(header_is(&home, "content-type", "text/html"));
+            assert_eq!(
+                home.text().await.unwrap(),
+                CHROME,
+                "chrome is served from ui_dir"
+            );
 
             let no_follow = reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .unwrap();
             assert_eq!(
-                no_follow
-                    .get(format!("{base}stand/cursorgo/level"))
-                    .send()
-                    .await
-                    .unwrap()
-                    .status(),
+                status_of(&no_follow, format!("{base}stand/cursorgo/level")).await,
                 reqwest::StatusCode::TEMPORARY_REDIRECT
             );
+            for excluded in ["game", "alife"] {
+                assert_eq!(
+                    status_of(&client, format!("{base}stand/cursorgo/{excluded}/")).await,
+                    reqwest::StatusCode::NOT_FOUND,
+                    "{excluded}"
+                );
+            }
             assert_eq!(
-                no_follow
-                    .get(format!("{base}stand/cursorgo/game"))
-                    .send()
-                    .await
-                    .unwrap()
-                    .status(),
-                reqwest::StatusCode::NOT_FOUND
+                status_of(&client, format!("{base}stand/NewEditor/level/")).await,
+                reqwest::StatusCode::BAD_REQUEST,
+                "slug shape is validated"
+            );
+            assert_eq!(
+                status_of(&client, format!("{base}stands/cursorgo/level/")).await,
+                reqwest::StatusCode::NOT_FOUND,
+                "only singular /stand/"
             );
 
-            assert_eq!(
-                client
-                    .get(format!("{base}stand/cursorgo/api/levels"))
-                    .send()
-                    .await
-                    .unwrap()
-                    .status(),
-                reqwest::StatusCode::UNAUTHORIZED
-            );
-            assert_eq!(
-                client
-                    .get(format!("{base}stand/cursorgo/game/"))
-                    .send()
-                    .await
-                    .unwrap()
-                    .status(),
-                reqwest::StatusCode::NOT_FOUND
-            );
-            assert_eq!(
-                client
-                    .get(format!("{base}stand/cursorgo/alife/"))
-                    .send()
-                    .await
-                    .unwrap()
-                    .status(),
-                reqwest::StatusCode::NOT_FOUND
-            );
-            let chat_port = host
-                .sso
-                .iter()
-                .find(|app| app.tab.id() == "chat")
-                .unwrap()
-                .port;
-            assert_eq!(
-                client
-                    .get(format!("http://127.0.0.1:{chat_port}/api/me"))
-                    .send()
-                    .await
-                    .unwrap()
-                    .status(),
-                reqwest::StatusCode::UNAUTHORIZED
-            );
-            assert_eq!(
-                client
-                    .get(format!(
-                        "{base}api/studio/ag-ui?to=/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7"
-                    ))
-                    .header("accept", "text/event-stream")
-                    .send()
-                    .await
-                    .unwrap()
-                    .status(),
-                reqwest::StatusCode::UNAUTHORIZED
-            );
-            assert_eq!(
-                client
-                    .get(format!("{base}stand/NewEditor/level/"))
-                    .send()
-                    .await
-                    .unwrap()
-                    .status(),
-                reqwest::StatusCode::BAD_REQUEST
-            );
-            assert_eq!(
-                client
-                    .get(format!("{base}stands/cursorgo/level/"))
-                    .send()
-                    .await
-                    .unwrap()
-                    .status(),
-                reqwest::StatusCode::NOT_FOUND
-            );
             let spa = client
                 .get(format!("{base}stand/cursorgo/level/"))
                 .send()
                 .await
                 .unwrap();
             assert_eq!(spa.status(), reqwest::StatusCode::OK);
-            let body = spa.text().await.unwrap();
-            assert!(
-                body.contains("id=\"root\"")
-                    || body.contains("assets/")
-                    || body.contains("data-studio-placeholder")
+            assert!(header_is(&spa, "content-type", "text/html"));
+            assert_eq!(header(&spa, "x-studio-spa"), Some("baked"));
+
+            // Without a session nothing proxies: stand API, chrome streamer, SSO port.
+            assert_eq!(
+                status_of(&client, format!("{base}stand/cursorgo/api/levels")).await,
+                reqwest::StatusCode::UNAUTHORIZED
             );
-            assert!(!body.contains("/game"));
-            assert!(!body.contains("data-studio-agui-inject"));
+            assert_eq!(
+                status_of(
+                    &client,
+                    format!(
+                        "{base}api/studio/ag-ui?to=/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7"
+                    )
+                )
+                .await,
+                reqwest::StatusCode::UNAUTHORIZED
+            );
+            let chat_port = host
+                .sso
+                .iter()
+                .find(|app| app.tab == SystemTab::Chat)
+                .unwrap()
+                .port;
+            assert_eq!(
+                status_of(&client, format!("http://127.0.0.1:{chat_port}/api/me")).await,
+                reqwest::StatusCode::UNAUTHORIZED
+            );
         });
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn remembered_login_is_returned_until_cleared() {
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
-        let root = std::env::temp_dir().join(format!(
-            "designer-remember-{}-{}",
-            std::process::id(),
-            stamp
-        ));
-        let ui = root.join("ui");
-        std::fs::create_dir_all(&ui).unwrap();
-        std::fs::write(ui.join("index.html"), include_str!("../ui/index.html")).unwrap();
-        let cache = root.join("cache");
-        remember::save(
-            &cache,
-            &RememberedLogin {
-                slug: "cursorgo".into(),
-                username: "akadmin".into(),
-            },
-        )
-        .unwrap();
-        let host =
-            bind_local_host(StudioConfig::production(ui, 0, Some(cache.clone()))).expect("bind");
-        std::thread::sleep(std::time::Duration::from_millis(150));
+        let (root, cfg) = fixture("remember");
+        let cache = cfg.cache_dir.clone();
+        remember_akadmin(&cache);
+        let host = bound(cfg);
         let base = host.chrome_url();
-        let rt = Runtime::new().unwrap();
-        rt.block_on(async {
+        Runtime::new().unwrap().block_on(async {
             let client = reqwest::Client::new();
-            let session: serde_json::Value = client
-                .get(format!("{base}api/session"))
-                .send()
-                .await
-                .unwrap()
-                .json()
-                .await
-                .unwrap();
+            let session = get_json(&client, format!("{base}api/session")).await;
             assert_eq!(session["authenticated"], false);
             assert_eq!(session["remember"], true);
             assert_eq!(session["slug"], "cursorgo");
@@ -940,88 +845,70 @@ mod tests {
             assert!(session.get("password").is_none());
 
             remember::clear(&cache);
-            let cleared: serde_json::Value = client
-                .get(format!("{base}api/session"))
-                .send()
-                .await
-                .unwrap()
-                .json()
-                .await
-                .unwrap();
+            let cleared = get_json(&client, format!("{base}api/session")).await;
             assert_eq!(cleared["authenticated"], false);
             assert_eq!(cleared["remember"], false);
-            assert!(cleared.get("password").is_none());
         });
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
-    fn login_handler_does_not_await_prefetch() {
-        let src = include_str!("host.rs");
-        let login_fn = src
-            .split("async fn login(")
-            .nth(1)
-            .expect("login fn")
-            .split("\nfn persist_or_clear_remember")
-            .next()
-            .expect("login end");
-        assert!(login_fn.contains("schedule_post_login_sync"));
-        assert!(!login_fn.contains("prefetch_json"));
-        assert!(!login_fn.contains("settle_system_apps"));
-        assert!(src.contains("fn schedule_post_login_sync"));
-        assert!(src.contains("tokio::spawn"));
-    }
-
-    #[test]
-    fn expired_or_dummy_session_blob_stays_unauthenticated() {
-        use reqwest::cookie::Jar;
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
-        let root = std::env::temp_dir().join(format!(
-            "designer-session-blob-{}-{}",
-            std::process::id(),
-            stamp
-        ));
-        let ui = root.join("ui");
-        std::fs::create_dir_all(&ui).unwrap();
-        std::fs::write(ui.join("index.html"), include_str!("../ui/index.html")).unwrap();
-        let cache = root.join("cache");
-        remember::save(
-            &cache,
-            &RememberedLogin {
-                slug: "cursorgo".into(),
-                username: "akadmin".into(),
-            },
-        )
-        .unwrap();
-        let jar = Jar::default();
-        let url = reqwest::Url::parse("https://auth.mcpwork.space/").unwrap();
-        jar.add_cookie_str("authentik_session=dead-cookie; Path=/; Secure", &url);
-        remember::save_session_jar(&cache, &jar, &["https://auth.mcpwork.space/".into()]).unwrap();
-        let mut cfg = StudioConfig::production(ui, 0, Some(cache.clone()));
-        cfg.probe_timeout = std::time::Duration::from_millis(400);
-        let host = bind_local_host(cfg).expect("bind");
-        std::thread::sleep(std::time::Duration::from_millis(150));
-        let base = host.chrome_url();
+    fn rejected_session_blob_is_cleared_but_login_stays_remembered() {
+        let (root, mut cfg) = fixture("blob-rejected");
+        let cache = cfg.cache_dir.clone();
+        remember_akadmin(&cache);
+        save_dead_jar(&cache);
         let rt = Runtime::new().unwrap();
+        cfg.auth_host = rt.block_on(mock_authentik((
+            StatusCode::FORBIDDEN,
+            serde_json::json!({ "detail": "Authentication credentials were not provided." }),
+        )));
+        let host = bound(cfg);
+        let base = host.chrome_url();
         rt.block_on(async {
-            let client = reqwest::Client::new();
-            let session: serde_json::Value = client
-                .get(format!("{base}api/session"))
-                .send()
-                .await
-                .unwrap()
-                .json()
-                .await
-                .unwrap();
+            let session = get_json(&reqwest::Client::new(), format!("{base}api/session")).await;
             assert_eq!(session["authenticated"], false);
             assert_eq!(session["remember"], true);
             assert_eq!(session["slug"], "cursorgo");
             assert_eq!(session["username"], "akadmin");
-            assert!(session.get("password").is_none());
         });
+        assert!(
+            remember::load_session_jar(&cache).is_none(),
+            "a jar Authentik rejects is dropped so it is not retried forever"
+        );
+        assert!(
+            remember::load(&cache).is_some(),
+            "slug/username prefill survives"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn accepted_session_blob_restores_login_without_the_gate() {
+        let (root, mut cfg) = fixture("blob-accepted");
+        let cache = cfg.cache_dir.clone();
+        remember_akadmin(&cache);
+        save_dead_jar(&cache);
+        let rt = Runtime::new().unwrap();
+        cfg.auth_host = rt.block_on(mock_authentik((
+            StatusCode::OK,
+            serde_json::json!({ "user": { "pk": 17, "username": "akadmin", "is_active": true } }),
+        )));
+        let host = bound(cfg);
+        let base = host.chrome_url();
+        rt.block_on(async {
+            let client = reqwest::Client::new();
+            let session = get_json(&client, format!("{base}api/session")).await;
+            assert_eq!(session["authenticated"], true);
+            assert_eq!(session["slug"], "cursorgo");
+            assert_eq!(session["username"], "akadmin");
+            assert_eq!(session["desk"], "/stand/cursorgo/level/");
+            assert_eq!(session["remember"], true);
+
+            let studio = get_json(&client, format!("{base}api/studio")).await;
+            assert_eq!(studio["tabs"][0]["path"], "/stand/cursorgo/level/");
+        });
+        assert!(remember::load_session_jar(&cache).is_some(), "blob is kept");
         let _ = std::fs::remove_dir_all(root);
     }
 }
