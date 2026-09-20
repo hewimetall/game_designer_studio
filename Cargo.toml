@@ -35,3 +35,10 @@ rust-embed = "8"
 tauri = { version = "2", features = [] }
 tokio = { version = "1", features = ["full"] }
 tower-http = { version = "0.6", features = ["cors", "fs"] }
+# OS credential store (Windows Credential Manager / macOS Keychain / Linux Secret Service).
+# keyring 3.6 Entry API is the current remember-login stack; v4 wants per-app store wiring.
+keyring = { version = "3.6", default-features = false, features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+# Android Keystore + SharedPreferences; Tauri Mobile already inits ndk-context.
+android-keyring = "0.2"

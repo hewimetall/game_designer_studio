@@ -146,13 +146,18 @@ async fn session_status(State(state): State<AppState>) -> Json<serde_json::Value
             "remember": remembered.is_some(),
         })),
         None => match remembered {
-            Some(login) => Json(serde_json::json!({
-                "authenticated": false,
-                "remember": true,
-                "slug": login.slug,
-                "username": login.username,
-                "password": login.password,
-            })),
+            Some(login) => {
+                let mut body = serde_json::json!({
+                    "authenticated": false,
+                    "remember": true,
+                    "slug": login.slug,
+                    "username": login.username,
+                });
+                if !login.password.is_empty() {
+                    body["password"] = serde_json::Value::String(login.password);
+                }
+                Json(body)
+            }
             None => Json(serde_json::json!({
                 "authenticated": false,
                 "remember": false,

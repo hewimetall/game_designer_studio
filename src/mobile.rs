@@ -31,6 +31,10 @@ pub fn run_android() {
     let chrome_url = chrome;
     tauri::Builder::default()
         .setup(move |app| {
+            #[cfg(target_os = "android")]
+            {
+                let _ = android_keyring::set_android_keyring_credential_builder();
+            }
             attach_tauri_emitter(app.handle().clone(), &progress);
             if let Some(window) = app.get_webview_window("main") {
                 window.navigate(tauri::Url::parse(&chrome_url)?)?;
