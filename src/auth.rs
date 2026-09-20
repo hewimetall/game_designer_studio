@@ -167,12 +167,10 @@ fn is_forbidden_totp_stage(component: &str) -> bool {
     c.contains("authenticator-validate") || c.contains("authenticator-totp") || c.contains("totp")
 }
 
-/// Hard error: this Authentik must not use TOTP. Never prompt, never generate
-/// a code, never persist `config_url` / `secret_key`, never send the user to
-/// auth.mcpwork.space to enter a TOTP.
+/// Never prompt, never RFC6238-generate a code, never persist a TOTP seed.
 fn totp_forbidden(component: &str) -> String {
     format!(
-        "Authentik misconfigured: this instance must not use TOTP (`{component}`). Expected identification → password only."
+        "Сессию или TOTP нужно один раз завершить на auth.mcpwork.space (`{component}`). Повторный вход здесь — только логин и пароль."
     )
 }
 
@@ -505,12 +503,11 @@ mod tests {
             "device_challenges": [{ "device_class": "totp" }]
         });
         let err = decide_stage(&challenge, "u", "p", &posted(), FLOW).unwrap_err();
-        assert!(err.contains("misconfigured"));
-        assert!(err.contains("TOTP"));
-        assert!(err.contains("identification → password only"));
+        assert!(err.contains("auth.mcpwork.space"));
+        assert!(err.contains("логин и пароль"));
         assert!(err.contains("ak-stage-authenticator-validate"));
-        assert!(!err.contains("auth.mcpwork.space"));
         assert!(!err.contains("введите код"));
+        assert!(!err.contains("misconfigured"));
         assert!(matches!(
             decide_stage(&challenge, "u", "p", &posted(), FLOW),
             Err(_)
@@ -525,9 +522,9 @@ mod tests {
             "secret_key": "JBSWY3DPEHPK3PXP"
         });
         let err = decide_stage(&challenge, "u", "p", &posted(), FLOW).unwrap_err();
-        assert!(err.contains("misconfigured"));
+        assert!(err.contains("auth.mcpwork.space"));
         assert!(err.contains("ak-stage-authenticator-totp"));
-        assert!(!err.contains("auth.mcpwork.space"));
+        assert!(!err.contains("misconfigured"));
         assert!(!err.contains("JBSWY3DPEHPK3PXP"));
         assert!(!err.contains("otpauth"));
         assert!(!err.contains("завести TOTP"));

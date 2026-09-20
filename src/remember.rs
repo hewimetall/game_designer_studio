@@ -7,8 +7,8 @@
 //! sits next to remember meta (`remembered_session.bin`, unix 0600).
 //!
 //! Passwords are not stored. TOTP seeds are not stored. The gate has no TOTP
-//! field. Authentik must be identification → password only; authenticator-validate
-//! / TOTP enroll is a misconfiguration, not a prompt and not a browser hop.
+//! field — if Authentik still wants `ak-stage-authenticator-validate`, finish
+//! that once in the browser on auth.mcpwork.space.
 
 use std::fs;
 use std::path::{Path, PathBuf};
