@@ -712,45 +712,45 @@ mod tests {
             let cycle_js = br#"import("./Workbench-ab12cd.js")"#;
             let mut pages = std::collections::HashMap::new();
             pages.insert(
-                "/stand/neweditor/level/".into(),
+                "/stand/cursorgo/level/".into(),
                 Bytes::copy_from_slice(index),
             );
             pages.insert(
-                "/stand/neweditor/level/assets/index-entry.js".into(),
+                "/stand/cursorgo/level/assets/index-entry.js".into(),
                 Bytes::copy_from_slice(entry_js),
             );
             pages.insert(
-                "/stand/neweditor/level/assets/index-entry.css".into(),
+                "/stand/cursorgo/level/assets/index-entry.css".into(),
                 Bytes::from_static(b"body{color:#111}"),
             );
             pages.insert(
-                "/stand/neweditor/level/assets/Workbench-ab12cd.js".into(),
+                "/stand/cursorgo/level/assets/Workbench-ab12cd.js".into(),
                 Bytes::copy_from_slice(chunk_js),
             );
             pages.insert(
-                "/stand/neweditor/level/assets/Workbench-ab12cd.css".into(),
+                "/stand/cursorgo/level/assets/Workbench-ab12cd.css".into(),
                 Bytes::from_static(b".wb{display:block}"),
             );
             pages.insert(
-                "/stand/neweditor/level/assets/only-mapdeps-xx1234.css".into(),
+                "/stand/cursorgo/level/assets/only-mapdeps-xx1234.css".into(),
                 Bytes::from_static(b".lazy{opacity:1}"),
             );
             pages.insert(
-                "/stand/neweditor/level/assets/solid-B7kQ2n1x.js".into(),
+                "/stand/cursorgo/level/assets/solid-B7kQ2n1x.js".into(),
                 Bytes::from_static(b"export const j=1"),
             );
             pages.insert(
-                "/stand/neweditor/level/assets/cycle-aa11bb.js".into(),
+                "/stand/cursorgo/level/assets/cycle-aa11bb.js".into(),
                 Bytes::copy_from_slice(cycle_js),
             );
             pages.insert(
-                "/stand/neweditor/sprites/".into(),
+                "/stand/cursorgo/sprites/".into(),
                 Bytes::from_static(b"<!doctype html><title>authentik</title><form>login</form>"),
             );
             let bestiary_remote = baked_bytes("bestiary/index.html").unwrap_or_else(|| {
                 Bytes::from_static(b"<!doctype html><title>authentik</title><form>login</form>")
             });
-            pages.insert("/stand/neweditor/bestiary/".into(), bestiary_remote);
+            pages.insert("/stand/cursorgo/bestiary/".into(), bestiary_remote);
             let origin = spawn_mock_stand(pages).await;
             let root = test_root("refresh");
             let proxy = test_proxy(origin, &root);
@@ -758,20 +758,20 @@ mod tests {
 
             assert!(DesignerTab::from_id("game").is_none());
             assert_eq!(
-                refresh_app(&proxy, &session, "neweditor", "game")
+                refresh_app(&proxy, &session, "cursorgo", "game")
                     .await
                     .unwrap(),
                 false
             );
             assert_eq!(
-                refresh_app(&proxy, &session, "neweditor", "alife")
+                refresh_app(&proxy, &session, "cursorgo", "alife")
                     .await
                     .unwrap(),
                 false
             );
 
             assert!(
-                refresh_app(&proxy, &session, "neweditor", "level")
+                refresh_app(&proxy, &session, "cursorgo", "level")
                     .await
                     .unwrap()
             );
@@ -802,14 +802,14 @@ mod tests {
             );
 
             assert_eq!(
-                refresh_app(&proxy, &session, "neweditor", "level")
+                refresh_app(&proxy, &session, "cursorgo", "level")
                     .await
                     .unwrap(),
                 false
             );
 
             assert_eq!(
-                refresh_app(&proxy, &session, "neweditor", "sprites")
+                refresh_app(&proxy, &session, "cursorgo", "sprites")
                     .await
                     .unwrap(),
                 false
@@ -826,7 +826,7 @@ mod tests {
                 )
                 .unwrap();
                 assert_eq!(
-                    refresh_app(&proxy, &session, "neweditor", "bestiary")
+                    refresh_app(&proxy, &session, "cursorgo", "bestiary")
                         .await
                         .unwrap(),
                     false
@@ -881,7 +881,7 @@ mod tests {
     fn test_session() -> Session {
         use std::sync::Arc;
         Session {
-            slug: "neweditor".into(),
+            slug: "cursorgo".into(),
             username: "tester".into(),
             client: reqwest::Client::new(),
             jar: Arc::new(reqwest::cookie::Jar::default()),
@@ -889,11 +889,11 @@ mod tests {
     }
 
     async fn spawn_mock_stand(pages: std::collections::HashMap<String, Bytes>) -> String {
+        use axum::Router;
         use axum::extract::State;
         use axum::http::{StatusCode, Uri};
         use axum::response::IntoResponse;
         use axum::routing::get;
-        use axum::Router;
         use std::sync::Arc;
 
         #[derive(Clone)]

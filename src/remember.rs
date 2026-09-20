@@ -8,6 +8,9 @@
 //!
 //! Passwords are not stored. This Authentik has no TOTP; the gate has no
 //! second-factor field and no TOTP seed is kept.
+//!
+//! Remembered `slug` is whatever last succeeded. A stale `neweditor` value is
+//! not migrated to `cursorgo` — log in again with the live stand slug.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -437,7 +440,7 @@ mod tests {
     fn save_load_roundtrip_keeps_password_out_of_the_file() {
         let dir = temp_dir();
         let login = RememberedLogin {
-            slug: "neweditor".into(),
+            slug: "cursorgo".into(),
             username: "akadmin".into(),
         };
         save(&dir, &login).unwrap();
@@ -470,6 +473,8 @@ mod tests {
     #[test]
     fn legacy_plaintext_password_is_stripped_not_returned() {
         let dir = temp_dir();
+        // Old meta may still say `neweditor`. That slug is not a live stand and
+        // is not rewritten to `cursorgo` — re-login with the live slug.
         std::fs::write(
             remember_path(&dir),
             r#"{"slug":"neweditor","username":"akadmin","password":"legacy-secret"}"#,
@@ -480,6 +485,7 @@ mod tests {
         assert_eq!(loaded.username, "akadmin");
         let disk = std::fs::read_to_string(remember_path(&dir)).unwrap();
         assert!(!disk.contains("legacy-secret"));
+        assert!(!disk.contains("cursorgo"));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -489,7 +495,7 @@ mod tests {
         save(
             &dir,
             &RememberedLogin {
-                slug: "neweditor".into(),
+                slug: "cursorgo".into(),
                 username: "akadmin".into(),
             },
         )

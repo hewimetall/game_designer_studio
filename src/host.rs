@@ -650,6 +650,8 @@ mod tests {
         assert!(!html.contains("grid-template-columns: minmax(140px, 220px) 1fr auto"));
         assert!(!html.contains("bottom: calc(16px + env(safe-area-inset-bottom))"));
         assert!(include_str!("../tauri.conf.json").contains("\"withGlobalTauri\": true"));
+        assert!(html.contains("placeholder=\"cursorgo\""));
+        assert!(!html.contains("placeholder=\"neweditor\""));
         assert!(!html.contains("src=\"/stand"));
         assert!(!html.contains("game-client"));
         let placeholder = missing_editor_html("level");
@@ -764,7 +766,7 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 no_follow
-                    .get(format!("{base}stand/neweditor/level"))
+                    .get(format!("{base}stand/cursorgo/level"))
                     .send()
                     .await
                     .unwrap()
@@ -773,7 +775,7 @@ mod tests {
             );
             assert_eq!(
                 no_follow
-                    .get(format!("{base}stand/neweditor/game"))
+                    .get(format!("{base}stand/cursorgo/game"))
                     .send()
                     .await
                     .unwrap()
@@ -783,7 +785,7 @@ mod tests {
 
             assert_eq!(
                 client
-                    .get(format!("{base}stand/neweditor/api/levels"))
+                    .get(format!("{base}stand/cursorgo/api/levels"))
                     .send()
                     .await
                     .unwrap()
@@ -792,7 +794,7 @@ mod tests {
             );
             assert_eq!(
                 client
-                    .get(format!("{base}stand/neweditor/game/"))
+                    .get(format!("{base}stand/cursorgo/game/"))
                     .send()
                     .await
                     .unwrap()
@@ -801,7 +803,7 @@ mod tests {
             );
             assert_eq!(
                 client
-                    .get(format!("{base}stand/neweditor/alife/"))
+                    .get(format!("{base}stand/cursorgo/alife/"))
                     .send()
                     .await
                     .unwrap()
@@ -832,8 +834,17 @@ mod tests {
                     .status(),
                 reqwest::StatusCode::BAD_REQUEST
             );
+            assert_eq!(
+                client
+                    .get(format!("{base}stands/cursorgo/level/"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                reqwest::StatusCode::NOT_FOUND
+            );
             let spa = client
-                .get(format!("{base}stand/neweditor/level/"))
+                .get(format!("{base}stand/cursorgo/level/"))
                 .send()
                 .await
                 .unwrap();
@@ -867,7 +878,7 @@ mod tests {
         remember::save(
             &cache,
             &RememberedLogin {
-                slug: "neweditor".into(),
+                slug: "cursorgo".into(),
                 username: "akadmin".into(),
             },
         )
@@ -889,7 +900,7 @@ mod tests {
                 .unwrap();
             assert_eq!(session["authenticated"], false);
             assert_eq!(session["remember"], true);
-            assert_eq!(session["slug"], "neweditor");
+            assert_eq!(session["slug"], "cursorgo");
             assert_eq!(session["username"], "akadmin");
             assert!(session.get("password").is_none());
 
@@ -945,7 +956,7 @@ mod tests {
         remember::save(
             &cache,
             &RememberedLogin {
-                slug: "neweditor".into(),
+                slug: "cursorgo".into(),
                 username: "akadmin".into(),
             },
         )
@@ -972,7 +983,7 @@ mod tests {
                 .unwrap();
             assert_eq!(session["authenticated"], false);
             assert_eq!(session["remember"], true);
-            assert_eq!(session["slug"], "neweditor");
+            assert_eq!(session["slug"], "cursorgo");
             assert_eq!(session["username"], "akadmin");
             assert!(session.get("password").is_none());
         });

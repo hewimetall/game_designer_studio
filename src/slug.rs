@@ -20,6 +20,7 @@ mod tests {
 
     #[test]
     fn accepts_stand_slugs() {
+        assert_eq!(parse_slug("cursorgo").unwrap(), "cursorgo");
         assert_eq!(parse_slug("neweditor").unwrap(), "neweditor");
         assert_eq!(parse_slug(" stand-01 ").unwrap(), "stand-01");
     }

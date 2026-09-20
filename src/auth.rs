@@ -479,8 +479,8 @@ mod tests {
     fn redirect_to_stand_path_uses_stand_origin() {
         let c = cfg();
         assert_eq!(
-            resolve_flow_redirect(&c, Some("/stand/neweditor/")),
-            Some("https://my.mcpwork.space/stand/neweditor/".into())
+            resolve_flow_redirect(&c, Some("/stand/cursorgo/")),
+            Some("https://my.mcpwork.space/stand/cursorgo/".into())
         );
         assert_eq!(
             resolve_flow_redirect(&c, Some("/if/flow/default-authentication-flow/")),
@@ -565,8 +565,7 @@ mod tests {
         }
         let username =
             std::env::var("DESIGNER_STUDIO_LIVE_USER").unwrap_or_else(|_| "akadmin".into());
-        let slug =
-            std::env::var("DESIGNER_STUDIO_LIVE_SLUG").unwrap_or_else(|_| "neweditor".into());
+        let slug = std::env::var("DESIGNER_STUDIO_LIVE_SLUG").unwrap_or_else(|_| "cursorgo".into());
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let session = login_with_password(&cfg(), &slug, &username, &password)

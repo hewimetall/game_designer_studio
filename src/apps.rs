@@ -54,6 +54,8 @@ impl DesignerTab {
     }
 
     /// Path the bundled Solid editor must see so `apiBasePath()` stays `/stand/<slug>/api`.
+    /// Live human URL is singular `/stand/<slug>/` (HEAD of `/stand/cursorgo/` 302s to
+    /// `/stand/cursorgo/level/`; `/stands/cursorgo/` is Authentik catch-all only).
     pub fn stand_path(self, slug: &str) -> String {
         format!("/stand/{}/{}/", slug, self.id())
     }
@@ -110,12 +112,14 @@ mod tests {
     #[test]
     fn stand_paths_keep_slug_prefix_for_existing_web_api_base() {
         assert_eq!(
-            DesignerTab::Level.stand_path("neweditor"),
-            "/stand/neweditor/level/"
+            DesignerTab::Level.stand_path("cursorgo"),
+            "/stand/cursorgo/level/"
         );
-        assert!(DesignerTab::Sprites
-            .stand_path("neweditor")
-            .starts_with("/stand/neweditor/"));
+        assert!(
+            DesignerTab::Sprites
+                .stand_path("cursorgo")
+                .starts_with("/stand/cursorgo/")
+        );
     }
 
     #[test]
