@@ -1,9 +1,9 @@
-//! Dedicated in-memory cache for Chat AG-UI **inject artifacts**.
+//! Dedicated in-memory cache for Chat **inject artifacts**.
 //!
 //! This is not the stand [`crate::cache::ReadCache`] and not the SSO SSE
-//! streamer. It stores Chat HTML after inject, the static inject script, and
-//! rewritten HttpAgent JS documents. It **refuses** `text/event-stream`,
-//! event-stream Accept, POST `RunAgentInput`, and any streaming response.
+//! streamer. It stores Chat HTML after inject and the static inject script.
+//! It **refuses** `text/event-stream`, GET `/api/runs/{uuid}`, POST, and any
+//! streaming response.
 
 use std::collections::HashMap;
 use std::sync::RwLock;
@@ -13,19 +13,17 @@ use bytes::Bytes;
 use sha2::{Digest, Sha256};
 
 use crate::inject::{
-    is_html_content_type_str, is_javascript_content_type, INJECT_JS, STUDIO_AGUI_PATH,
+    is_chat_run_sse_path, is_html_content_type_str, is_javascript_content_type, INJECT_JS,
+    STUDIO_AGUI_PATH,
 };
 
 const MEM_BUDGET: usize = 16 * 1024 * 1024;
 const HTML_TTL: Duration = Duration::from_secs(30);
-const ASSET_TTL: Duration = Duration::from_secs(300);
-const IMMUTABLE_TTL: Duration = Duration::from_secs(3600);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArtifactKind {
     Html,
     Script,
-    Asset,
 }
 
 #[derive(Debug, Clone)]
@@ -56,31 +54,6 @@ impl InjectObject {
             kind: ArtifactKind::Html,
             stored_at: Instant::now(),
             ttl: HTML_TTL,
-        }
-    }
-
-    pub fn asset(
-        status: u16,
-        content_type: String,
-        body: Bytes,
-        etag: Option<String>,
-        last_modified: Option<String>,
-        cache_control: Option<&str>,
-    ) -> Self {
-        let ttl = if cache_control.is_some_and(|c| c.to_ascii_lowercase().contains("immutable")) {
-            IMMUTABLE_TTL
-        } else {
-            ASSET_TTL
-        };
-        Self {
-            status,
-            content_type,
-            body,
-            etag,
-            last_modified,
-            kind: ArtifactKind::Asset,
-            stored_at: Instant::now(),
-            ttl,
         }
     }
 
@@ -163,7 +136,7 @@ impl InjectCache {
         self.mem.read().map(|m| m.len()).unwrap_or(0)
     }
 
-    /// Event-stream / POST RunAgentInput / studio streamer path are never stored.
+    /// Event-stream / GET `/api/runs/{uuid}` / studio streamer path are never stored.
     pub fn may_store(method: &str, accept: Option<&str>, content_type: &str, path: &str) -> bool {
         let method = method.to_ascii_uppercase();
         if method != "GET" && method != "HEAD" {
@@ -171,6 +144,9 @@ impl InjectCache {
         }
         let path_only = path.split('?').next().unwrap_or(path);
         if path_only == STUDIO_AGUI_PATH || path_only.starts_with(&format!("{STUDIO_AGUI_PATH}/")) {
+            return false;
+        }
+        if is_chat_run_sse_path(path) {
             return false;
         }
         if is_stream_media(accept.unwrap_or("")) || is_stream_media(content_type) {
@@ -187,8 +163,7 @@ impl Default for InjectCache {
 }
 
 pub fn is_stream_media(value: &str) -> bool {
-    let v = value.to_ascii_lowercase();
-    v.contains("text/event-stream") || v.contains("application/vnd.ag-ui.event+proto")
+    value.to_ascii_lowercase().contains("text/event-stream")
 }
 
 fn normalize_ct(ct: &str) -> String {
@@ -232,30 +207,24 @@ mod tests {
     use crate::inject::{inject_chat_html, INJECT_MARKER};
 
     #[test]
-    fn refuses_event_stream_post_and_streamer_path() {
+    fn refuses_event_stream_runs_and_streamer_path() {
         assert!(!InjectCache::may_store(
-            "POST",
+            "GET",
             Some("text/event-stream"),
             "text/event-stream",
-            "/agent"
+            "/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7?since=0"
         ));
         assert!(!InjectCache::may_store(
             "POST",
             Some("application/json"),
             "application/json",
-            "/agent"
-        ));
-        assert!(!InjectCache::may_store(
-            "POST",
-            Some("text/event-stream"),
-            "application/json",
-            STUDIO_AGUI_PATH
+            "/api/agent/game"
         ));
         assert!(!InjectCache::may_store(
             "GET",
             Some("text/event-stream"),
-            "text/html",
-            "/"
+            "application/json",
+            STUDIO_AGUI_PATH
         ));
         assert!(!InjectCache::may_store(
             "GET",
@@ -271,9 +240,9 @@ mod tests {
         ));
         assert!(!InjectCache::may_store(
             "GET",
-            Some("application/vnd.ag-ui.event+proto"),
-            "text/javascript",
-            "/app.js"
+            Some("*/*"),
+            "application/json",
+            "/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7"
         ));
         assert!(InjectCache::may_store(
             "GET",
@@ -285,17 +254,20 @@ mod tests {
             "GET",
             Some("*/*"),
             "text/javascript",
-            "/assets/app.js"
+            "/_next/static/chunks/app/s/layout.js"
+        ));
+        assert!(!InjectCache::may_store(
+            "GET",
+            Some("application/json"),
+            "application/json",
+            "/api/threads"
         ));
     }
 
     #[test]
     fn hit_returns_injected_html_without_put_twice() {
         let cache = InjectCache::new();
-        let html = inject_chat_html(
-            "<!doctype html><html><head></head><body>chat</body></html>",
-            "https://chat.mcpwork.space",
-        );
+        let html = inject_chat_html("<!doctype html><html><head></head><body>chat</body></html>");
         assert!(html.contains(INJECT_MARKER));
         let key = InjectCache::key("https://chat.mcpwork.space/", "text/html");
         cache.put(

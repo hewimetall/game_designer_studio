@@ -849,10 +849,10 @@ mod tests {
             );
             assert_eq!(
                 client
-                    .post(format!("{base}api/studio/ag-ui?to=/agent"))
+                    .get(format!(
+                        "{base}api/studio/ag-ui?to=/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7"
+                    ))
                     .header("accept", "text/event-stream")
-                    .header("content-type", "application/json")
-                    .body(r#"{"threadId":"t1","runId":"r1","messages":[]}"#)
                     .send()
                     .await
                     .unwrap()

@@ -5,25 +5,23 @@
 //! with the same reqwest cookie jar as the stand (Authentik outpost cookie is
 //! `Domain=mcpwork.space`).
 //!
-//! Chat is AG-UI (CopilotKit-style), not a classic WS-only SPA. The AG-UI 1.0
-//! default binding is HTTP POST of `RunAgentInput` JSON with
-//! `Accept: text/event-stream`; the run comes back as SSE
-//! (`Content-Type: text/event-stream`). HttpAgent also sets those headers.
-//! Optional HTTP + protobuf (`application/vnd.ag-ui.event+proto`) is the same
-//! POST with a framed body stream. Buffering `res.bytes().await` would hang the
-//! composer until the run finished or the GET/write timeout killed it.
+//! Live Chat (`chat.mcpwork.space`) is a Next.js Longgraph shell, not CopilotKit
+//! `HttpAgent` and not a WebSocket SPA. The composer `POST /api/agent/{id}`
+//! (`content-type: application/json`) returns `202 application/json`
+//! `{runId,threadId}`. The run is `GET /api/runs/{uuid}?since=` with
+//! `Accept: text/event-stream` and `Content-Type: text/event-stream` JSON `data:`
+//! events. Relative `/api/…` already hits this loopback proxy (cookie jar in
+//! Rust; WebView cookies are unused: Tauri #12988 / #13045).
 //!
-//! The Chat SPA's HttpAgent URL is often an absolute `chat.mcpwork.space`
-//! origin. That hop never sees the native jar (WebView cookies: Tauri #12988 /
-//! #13045). Chat HTML is patched with a small inject script so fetch /
-//! EventSource / HttpAgent hit studio-owned `POST /api/studio/ag-ui`. Rust
-//! then forwards with the Authentik jar. Injected HTML is stored in
-//! [`crate::inject_cache::InjectCache`]; the SSE byte stream never consults it.
+//! Chat HTML (only) gets a small inject so an **absolute** chat-origin GET
+//! `/api/runs/{uuid}` SSE still reaches [`STUDIO_AGUI_PATH`]. Injected HTML is
+//! stored in [`crate::inject_cache::InjectCache`]; the SSE byte stream never
+//! consults it. Buffering `res.bytes().await` on the run would hang until the
+//! GET/write timeout killed it.
 //!
-//! WebView cookies stay unused. Set-Cookie from the origin is kept in the jar,
-//! not copied to the iframe. WebSocket upgrades stay 501 (jar lives in Rust;
-//! default AG-UI does not need WS). SSE streaming is the AG-UI path that must
-//! work: bytes as-is, 15 minute timeout, `Accept-Encoding: identity`.
+//! WebSocket upgrades stay 501 (jar lives in Rust; production chat does not use
+//! WS for the run). Stream path: bytes as-is, 15 minute timeout,
+//! `Accept-Encoding: identity`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -39,8 +37,8 @@ use reqwest::Response;
 use crate::apps::SystemTab;
 use crate::config::StudioConfig;
 use crate::inject::{
-    agui_upstream_path, is_html_content_type_str, is_javascript_content_type,
-    rewrite_http_agent_urls, script_src_for_request, STUDIO_AGUI_PATH, STUDIO_INJECT_JS_PATH,
+    agui_upstream_path, is_chat_run_sse_path, is_html_content_type_str, script_src_for_request,
+    STUDIO_AGUI_PATH, STUDIO_INJECT_JS_PATH,
 };
 use crate::inject_cache::{is_stream_media, InjectCache, InjectObject};
 use crate::proxy::Proxy;
@@ -160,8 +158,8 @@ async fn agui_studio(
     handle_studio_agui(&state.proxy, &state.origin, method, headers, uri, body).await
 }
 
-/// Studio-owned AG-UI run: `session.client` + streamed SSE. Used on the Chat
-/// loopback port and on chrome `/api/studio/ag-ui`.
+/// Studio-owned GET `/api/runs/{uuid}` SSE: `session.stream_client`. Used on
+/// the Chat loopback port and on chrome `/api/studio/ag-ui`.
 pub async fn handle_studio_agui(
     proxy: &Proxy,
     chat_origin: &str,
@@ -173,13 +171,20 @@ pub async fn handle_studio_agui(
     if is_websocket_upgrade(&headers) {
         return websocket_unsupported(uri.path());
     }
+    if method != Method::GET && method != Method::HEAD {
+        return (
+            StatusCode::METHOD_NOT_ALLOWED,
+            axum::Json(serde_json::json!({ "error": "чат стримит GET /api/runs/{id}?since=" })),
+        )
+            .into_response();
+    }
     let Some(session) = proxy.live.session() else {
         return unauthorized();
     };
     let Some(pq) = agui_upstream_path(&headers, uri.query(), chat_origin) else {
         return (
             StatusCode::BAD_REQUEST,
-            axum::Json(serde_json::json!({ "error": "ag-ui url вне chat origin" })),
+            axum::Json(serde_json::json!({ "error": "только GET /api/runs/{uuid} на chat origin" })),
         )
             .into_response();
     };
@@ -238,8 +243,7 @@ fn unauthorized() -> axum::response::Response {
         .into_response()
 }
 
-/// Chat HTML (and rewritten JS) GET: cache lookup → fetch → inject → store.
-/// Does not run for SSE / POST RunAgentInput.
+/// Chat HTML GET: cache lookup → fetch → inject → store. Not SSE, not JS bundles.
 async fn chat_document(
     session: &Session,
     state: &SsoState,
@@ -249,13 +253,7 @@ async fn chat_document(
 ) -> axum::response::Response {
     let origin = state.origin.trim_end_matches('/');
     let url = format!("{origin}{path_and_query}");
-    let expect_js = path.rsplit('.').next() == Some("js");
-    let key_ct = if expect_js {
-        "text/javascript"
-    } else {
-        "text/html"
-    };
-    let key = InjectCache::key(&url, key_ct);
+    let key = InjectCache::key(&url, "text/html");
     if let Some(hit) = state.inject_cache.get_fresh(&key) {
         return inject_object_response(hit, "hit");
     }
@@ -297,9 +295,6 @@ async fn chat_document(
             if is_stream_media(&ct) {
                 return sso_response(res);
             }
-            if is_javascript_content_type(&ct) {
-                return finish_js(res, origin, &url, path, &incoming, &state.inject_cache).await;
-            }
             if !is_html_content_type_str(&ct) {
                 return sso_response(res);
             }
@@ -319,7 +314,7 @@ async fn chat_document(
 
 async fn finish_html(
     res: Response,
-    origin: &str,
+    _origin: &str,
     url: &str,
     path: &str,
     incoming: &HeaderMap,
@@ -335,10 +330,7 @@ async fn finish_html(
         }
     };
     let src = script_src_for_request(incoming);
-    let html = inject_agui_markup(
-        &rewrite_http_agent_urls(&String::from_utf8_lossy(&bytes), origin),
-        &src,
-    );
+    let html = inject_agui_markup(&String::from_utf8_lossy(&bytes), &src);
     let object = InjectObject::html(status, Bytes::from(html.into_bytes()), etag, last_modified);
     let accept = incoming
         .get(axum::http::header::ACCEPT)
@@ -349,57 +341,6 @@ async fn finish_html(
     inject_object_response(object, "miss")
 }
 
-async fn finish_js(
-    res: Response,
-    origin: &str,
-    url: &str,
-    path: &str,
-    incoming: &HeaderMap,
-    cache: &InjectCache,
-) -> axum::response::Response {
-    let status = res.status().as_u16();
-    let ct = content_type_of(&res);
-    let etag = header_string(&res, reqwest::header::ETAG);
-    let last_modified = header_string(&res, reqwest::header::LAST_MODIFIED);
-    let cache_control = header_string(&res, reqwest::header::CACHE_CONTROL);
-    let bytes = match res.bytes().await {
-        Ok(b) => b,
-        Err(err) => {
-            return error_html(StatusCode::BAD_GATEWAY, &err.to_string());
-        }
-    };
-    let text = String::from_utf8_lossy(&bytes);
-    let rewritten = rewrite_http_agent_urls(&text, origin);
-    if rewritten != text {
-        let object = InjectObject::asset(
-            status,
-            ct,
-            Bytes::from(rewritten.into_bytes()),
-            etag,
-            last_modified,
-            cache_control.as_deref(),
-        );
-        let accept = incoming
-            .get(axum::http::header::ACCEPT)
-            .and_then(|v| v.to_str().ok());
-        if InjectCache::may_store("GET", accept, "text/javascript", path) {
-            cache.put(InjectCache::key(url, "text/javascript"), object.clone());
-        }
-        return inject_object_response(object, "miss");
-    }
-    let mut out = axum::response::Response::new(Body::from(bytes));
-    *out.status_mut() = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);
-    if let Ok(val) = HeaderValue::from_str(&ct) {
-        out.headers_mut()
-            .insert(axum::http::header::CONTENT_TYPE, val);
-    }
-    out.headers_mut().insert(
-        HeaderName::from_static("x-studio-sso"),
-        HeaderValue::from_static("live"),
-    );
-    out
-}
-
 fn inject_object_response(
     hit: InjectObject,
     cache_state: &'static str,
@@ -407,7 +348,6 @@ fn inject_object_response(
     let kind = match hit.kind {
         crate::inject_cache::ArtifactKind::Html => "html",
         crate::inject_cache::ArtifactKind::Script => "script",
-        crate::inject_cache::ArtifactKind::Asset => "asset",
     };
     let mut res = axum::response::Response::new(Body::from(hit.body));
     *res.status_mut() = StatusCode::from_u16(hit.status).unwrap_or(StatusCode::OK);
@@ -463,7 +403,7 @@ fn looks_like_chat_document(method: &Method, path: &str, headers: &HeaderMap) ->
     if *method != Method::GET {
         return false;
     }
-    if is_sse_request(headers, path) {
+    if is_sse_request(method, headers, path) {
         return false;
     }
     let path_only = path.split('?').next().unwrap_or(path);
@@ -481,9 +421,8 @@ fn looks_like_chat_document(method: &Method, path: &str, headers: &HeaderMap) ->
     path_only == "/"
         || path_only.ends_with('/')
         || path_only.ends_with(".html")
-        || path_only.ends_with(".js")
+        || path_only.starts_with("/s/")
         || accept_l.contains("text/html")
-        || accept_l.contains("javascript")
 }
 
 fn is_obvious_non_document(path: &str) -> bool {
@@ -500,6 +439,7 @@ fn is_obvious_non_document(path: &str) -> bool {
         || p.ends_with(".woff2")
         || p.ends_with(".ttf")
         || p.ends_with(".map")
+        || p.ends_with(".js")
 }
 
 fn attach_forward_headers(
@@ -540,7 +480,7 @@ pub async fn forward_sso(
 ) -> axum::response::Response {
     let origin = origin.trim_end_matches('/');
     let url = format!("{origin}{path_and_query}");
-    let stream_run = is_sse_request(&incoming, path_and_query);
+    let stream_run = is_sse_request(&method, &incoming, path_and_query);
     let client = if stream_run {
         &session.stream_client
     } else {
@@ -577,35 +517,27 @@ fn sso_unusable(res: &Response, origin: &str) -> bool {
     !StudioConfig::url_matches_origin(res.url(), origin)
 }
 
-/// AG-UI HttpAgent: `Accept: text/event-stream`. Protobuf binding adds
-/// `application/vnd.ag-ui.event+proto` on the same POST.
-/// Live METRO-ARK chat also GETs `/api/runs/{id}?since=` as SSE.
+/// Live chat run: `GET /api/runs/{uuid}?since=` with `Accept: text/event-stream`.
 fn wants_event_stream(headers: &HeaderMap) -> bool {
-    accept_is_agui_stream(headers.get(axum::http::header::ACCEPT))
+    accept_is_event_stream(headers.get(axum::http::header::ACCEPT))
 }
 
-fn is_runs_sse_path(path: &str) -> bool {
-    let p = path.split('?').next().unwrap_or(path);
-    p == "/api/runs" || p.starts_with("/api/runs/")
+fn is_sse_request(method: &Method, headers: &HeaderMap, path: &str) -> bool {
+    wants_event_stream(headers) || (*method == Method::GET && is_chat_run_sse_path(path))
 }
 
-fn is_sse_request(headers: &HeaderMap, path: &str) -> bool {
-    wants_event_stream(headers) || is_runs_sse_path(path)
-}
-
-fn accept_is_agui_stream(value: Option<&HeaderValue>) -> bool {
+fn accept_is_event_stream(value: Option<&HeaderValue>) -> bool {
     value
         .and_then(|v| v.to_str().ok())
-        .is_some_and(is_agui_stream_accept)
+        .is_some_and(is_event_stream_accept)
 }
 
-fn is_agui_stream_accept(accept: &str) -> bool {
-    let accept = accept.to_ascii_lowercase();
-    accept.contains("text/event-stream") || accept.contains("application/vnd.ag-ui.event+proto")
+fn is_event_stream_accept(accept: &str) -> bool {
+    accept.to_ascii_lowercase().contains("text/event-stream")
 }
 
 fn sso_timeout(method: &Method, incoming: &HeaderMap, path: &str, cfg: &StudioConfig) -> Duration {
-    if is_sse_request(incoming, path) {
+    if is_sse_request(method, incoming, path) {
         cfg.stream_timeout
     } else if *method == Method::GET || *method == Method::HEAD {
         cfg.get_timeout
@@ -662,7 +594,7 @@ fn websocket_unsupported(path: &str) -> axum::response::Response {
     error_html(
         StatusCode::NOT_IMPLEMENTED,
         &format!(
-            "WebSocket `{path}` студия пока не проксирует (cookie jar в Rust, не в WebView). HTTP/SSE AG-UI к этому origin идёт."
+            "WebSocket `{path}` студия пока не проксирует (cookie jar в Rust, не в WebView). HTTP/SSE чата: GET /api/runs/{{id}}?since=."
         ),
     )
 }
@@ -903,38 +835,25 @@ mod tests {
     }
 
     #[test]
-    fn agui_accept_uses_stream_timeout() {
+    fn live_chat_contract_timeouts() {
         let cfg = StudioConfig::production(std::path::PathBuf::from("ui"), 0, None);
         let mut sse = HeaderMap::new();
         sse.insert(
             axum::http::header::ACCEPT,
             HeaderValue::from_static("text/event-stream"),
         );
+        let run = "/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7?since=0";
         assert_eq!(
-            sso_timeout(&Method::POST, &sse, "/agent", &cfg),
+            sso_timeout(&Method::GET, &sse, run, &cfg),
             cfg.stream_timeout
         );
         assert_eq!(
-            sso_timeout(&Method::GET, &sse, "/api/runs/x", &cfg),
-            cfg.stream_timeout
-        );
-        assert_eq!(
-            sso_timeout(&Method::GET, &HeaderMap::new(), "/api/runs/x?since=0", &cfg),
+            sso_timeout(&Method::GET, &HeaderMap::new(), run, &cfg),
             cfg.stream_timeout
         );
         assert_ne!(cfg.stream_timeout, cfg.get_timeout);
         assert_ne!(cfg.stream_timeout, cfg.write_timeout);
         assert!(cfg.stream_timeout >= Duration::from_secs(5 * 60));
-
-        let mut proto = HeaderMap::new();
-        proto.insert(
-            axum::http::header::ACCEPT,
-            HeaderValue::from_static("application/vnd.ag-ui.event+proto, text/event-stream;q=0.9"),
-        );
-        assert_eq!(
-            sso_timeout(&Method::POST, &proto, "/agent", &cfg),
-            cfg.stream_timeout
-        );
         assert_eq!(
             sso_timeout(&Method::GET, &HeaderMap::new(), "/", &cfg),
             cfg.get_timeout
@@ -943,12 +862,34 @@ mod tests {
             sso_timeout(&Method::POST, &HeaderMap::new(), "/api/agent/game", &cfg),
             cfg.write_timeout
         );
+        assert_eq!(
+            sso_timeout(
+                &Method::POST,
+                &HeaderMap::new(),
+                "/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7/cancel",
+                &cfg
+            ),
+            cfg.write_timeout
+        );
+        assert_eq!(
+            sso_timeout(
+                &Method::GET,
+                &HeaderMap::new(),
+                "/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7/scouts/abc",
+                &cfg
+            ),
+            cfg.get_timeout
+        );
         assert!(wants_event_stream(&sse));
         assert!(!wants_event_stream(&HeaderMap::new()));
-        assert!(is_runs_sse_path(
+        assert!(is_chat_run_sse_path(
             "/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7"
         ));
-        assert!(!is_runs_sse_path("/api/agent/game"));
+        assert!(!is_chat_run_sse_path("/api/agent/game"));
+        assert!(!is_chat_run_sse_path("/agent"));
+        assert!(!is_chat_run_sse_path(
+            "/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7/cancel"
+        ));
     }
 
     #[test]
@@ -968,8 +909,8 @@ mod tests {
                 let release = release.clone();
                 let first_sent = first_sent.clone();
                 axum::Router::new().route(
-                    "/agent",
-                    axum::routing::post(move |req: axum::extract::Request| {
+                    "/api/runs/{id}",
+                    axum::routing::get(move |req: axum::extract::Request| {
                         let release = release.clone();
                         let first_sent = first_sent.clone();
                         async move {
@@ -1050,11 +991,11 @@ mod tests {
             });
 
             let mut res = reqwest::Client::new()
-                .post(format!("http://{addr}/agent"))
+                .get(format!(
+                    "http://{addr}/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7?since=0"
+                ))
                 .header("accept", "text/event-stream")
-                .header("content-type", "application/json")
                 .header("x-csrf-token", "tok-sse")
-                .body(r#"{"threadId":"t1","runId":"r1","messages":[]}"#)
                 .send()
                 .await
                 .unwrap();
@@ -1097,7 +1038,6 @@ mod tests {
             assert!(first.contains("\"ae\":\"identity\""));
             assert!(first.contains("text/event-stream"));
             assert!(first.contains("tok-sse"));
-            assert!(first.contains("application/json"));
             assert!(
                 first_sent.load(Ordering::SeqCst),
                 "origin must have emitted the first chunk"
@@ -1142,24 +1082,29 @@ mod tests {
         assert!(AGUI_INJECT_JS.contains("/api/studio/ag-ui"));
         assert!(AGUI_INJECT_JS.contains("X-Studio-Agui-Url"));
         assert!(AGUI_INJECT_JS.contains("text/event-stream"));
-        assert!(AGUI_INJECT_JS.contains("application/json"));
-        assert!(AGUI_INJECT_JS.contains("EventSource"));
+        assert!(AGUI_INJECT_JS.contains("api\\/runs\\/"));
+        assert!(AGUI_INJECT_JS.contains("isAbsoluteRunSse"));
+        assert!(!AGUI_INJECT_JS.contains("EventSource"));
+        assert!(!AGUI_INJECT_JS.contains("vnd.ag-ui"));
+        assert!(!AGUI_INJECT_JS.contains("HttpAgent"));
+        assert!(!AGUI_INJECT_JS.contains("copilotkit"));
         assert!(!AGUI_INJECT_JS.contains("looksAguiUrl"));
     }
 
     #[test]
     fn agui_target_stays_on_chat_origin() {
+        let run = "/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7?since=0";
         assert_eq!(
-            sanitize_agui_target("/agent", "https://chat.mcpwork.space").as_deref(),
-            Some("/agent")
+            sanitize_agui_target(run, "https://chat.mcpwork.space").as_deref(),
+            Some(run)
         );
         assert_eq!(
             sanitize_agui_target(
-                "https://chat.mcpwork.space/api/copilotkit?x=1",
+                "https://chat.mcpwork.space/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7?since=0",
                 "https://chat.mcpwork.space"
             )
             .as_deref(),
-            Some("/api/copilotkit?x=1")
+            Some(run)
         );
         assert!(
             sanitize_agui_target("https://evil.example/agent", "https://chat.mcpwork.space")
@@ -1252,7 +1197,9 @@ mod tests {
             assert_eq!(js.status(), reqwest::StatusCode::OK);
             let js_body = js.text().await.unwrap();
             assert!(js_body.contains("window.fetch"));
-            assert!(js_body.contains("/api/studio/ag-ui"));
+            assert!(js_body.contains("api\\/runs\\/"));
+            assert!(js_body.contains("isAbsoluteRunSse"));
+            assert!(!js_body.contains("EventSource"));
 
             let s3 = client
                 .get(format!("http://{s3_addr}/"))
@@ -1311,8 +1258,8 @@ mod tests {
                 let release = release.clone();
                 let first_sent = first_sent.clone();
                 axum::Router::new().route(
-                    "/agent",
-                    axum::routing::post(move |req: axum::extract::Request| {
+                    "/api/runs/{id}",
+                    axum::routing::get(move |req: axum::extract::Request| {
                         let release = release.clone();
                         let first_sent = first_sent.clone();
                         async move {
@@ -1371,13 +1318,12 @@ mod tests {
                 axum::serve(listener, app).await.unwrap();
             });
 
+            let run = "/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7?since=0";
             let mut res = reqwest::Client::new()
-                .post(format!("http://{addr}{AGUI_ENDPOINT}"))
+                .get(format!("http://{addr}{AGUI_ENDPOINT}"))
                 .header("accept", "text/event-stream")
-                .header("content-type", "application/json")
-                .header("x-studio-agui-url", format!("{origin}/agent"))
+                .header("x-studio-agui-url", format!("{origin}{run}"))
                 .header("x-studio-agui-url-evil", "https://evil.example/agent")
-                .body(r#"{"threadId":"t1","runId":"r1","messages":[]}"#)
                 .send()
                 .await
                 .unwrap();
@@ -1432,14 +1378,33 @@ mod tests {
             assert!(String::from_utf8_lossy(&rest).contains("RUN_FINISHED"));
 
             let blocked = reqwest::Client::new()
-                .post(format!("http://{addr}{AGUI_ENDPOINT}"))
+                .get(format!("http://{addr}{AGUI_ENDPOINT}"))
                 .header("accept", "text/event-stream")
                 .header("x-studio-agui-url", "https://evil.example/agent")
-                .body("{}")
                 .send()
                 .await
                 .unwrap();
             assert_eq!(blocked.status(), reqwest::StatusCode::BAD_REQUEST);
+            let post = reqwest::Client::new()
+                .post(format!("http://{addr}{AGUI_ENDPOINT}"))
+                .header("accept", "text/event-stream")
+                .header(
+                    "x-studio-agui-url",
+                    format!("{origin}/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7"),
+                )
+                .body("{}")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(post.status(), reqwest::StatusCode::METHOD_NOT_ALLOWED);
+            let invented = reqwest::Client::new()
+                .get(format!("http://{addr}{AGUI_ENDPOINT}"))
+                .header("accept", "text/event-stream")
+                .query(&[("to", "/api/copilotkit")])
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(invented.status(), reqwest::StatusCode::BAD_REQUEST);
         });
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -1507,7 +1472,8 @@ mod tests {
                                 gets.fetch_add(1, Ordering::SeqCst);
                                 let mut res = axum::response::Response::new(Body::from(
                                     r#"<!doctype html><html><head><title>chat</title></head><body>
-<script>new HttpAgent({ url: "ORIGIN/agent" });</script>
+<script>fetch("/api/agent/game",{method:"POST",headers:{"content-type":"application/json"}});</script>
+<script>fetch("/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7?since=0",{headers:{accept:"text/event-stream"}});</script>
 </body></html>"#,
                                 ));
                                 res.headers_mut().insert(
@@ -1519,14 +1485,28 @@ mod tests {
                         }),
                     )
                     .route(
-                        "/agent",
-                        axum::routing::post(|| async {
+                        "/api/runs/{id}",
+                        axum::routing::get(|| async {
                             let mut res = axum::response::Response::new(Body::from(
                                 "data: {\"type\":\"RUN_STARTED\"}\n\n",
                             ));
                             res.headers_mut().insert(
                                 axum::http::header::CONTENT_TYPE,
                                 HeaderValue::from_static("text/event-stream"),
+                            );
+                            res
+                        }),
+                    )
+                    .route(
+                        "/api/agent/{id}",
+                        axum::routing::post(|| async {
+                            let mut res = axum::response::Response::new(Body::from(
+                                r#"{"runId":"r1","threadId":"t1"}"#,
+                            ));
+                            *res.status_mut() = axum::http::StatusCode::ACCEPTED;
+                            res.headers_mut().insert(
+                                axum::http::header::CONTENT_TYPE,
+                                HeaderValue::from_static("application/json"),
                             );
                             res
                         }),
@@ -1559,7 +1539,15 @@ mod tests {
             );
             let html = first.text().await.unwrap();
             assert!(html.contains(AGUI_INJECT_MARKER));
-            assert!(html.contains("/api/studio/ag-ui"));
+            assert!(html.contains("/api/studio/ag-ui-inject.js"));
+            assert!(
+                html.contains(r#"/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7?since=0"#),
+                "relative GET /api/runs must not be rewritten: {html}"
+            );
+            assert!(
+                !html.contains("/api/studio/ag-ui?to="),
+                "must not invent streamer query rewrites in HTML: {html}"
+            );
             assert_eq!(gets.load(Ordering::SeqCst), 1);
             assert_eq!(cache.len(), 1);
 
@@ -1581,11 +1569,10 @@ mod tests {
             assert_eq!(cache.len(), 1);
 
             let sse = client
-                .post(format!("http://{addr}{AGUI_ENDPOINT}"))
+                .get(format!(
+                    "http://{addr}/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7?since=0"
+                ))
                 .header("accept", "text/event-stream")
-                .header("content-type", "application/json")
-                .header("x-studio-agui-url", format!("{origin}/agent"))
-                .body(r#"{"threadId":"t1","runId":"r1","messages":[]}"#)
                 .send()
                 .await
                 .unwrap();
@@ -1598,10 +1585,24 @@ mod tests {
                 .contains("text/event-stream"));
             assert!(sse.headers().get("x-studio-inject-cache").is_none());
             let _ = sse.bytes().await;
+            let agent = client
+                .post(format!("http://{addr}/api/agent/game"))
+                .header("content-type", "application/json")
+                .body(r#"{"threadId":"t1","messages":[]}"#)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(agent.status(), reqwest::StatusCode::ACCEPTED);
+            assert!(agent
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .contains("application/json"));
             assert_eq!(
                 cache.len(),
                 1,
-                "event-stream / POST RunAgentInput must not enter inject cache"
+                "GET /api/runs SSE and POST /api/agent JSON must not enter inject cache"
             );
         });
         let _ = std::fs::remove_dir_all(dir);

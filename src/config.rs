@@ -13,7 +13,7 @@ pub struct StudioConfig {
     pub bind_port: u16,
     pub get_timeout: Duration,
     pub write_timeout: Duration,
-    /// Overall timeout for AG-UI / SSE runs (HTTP POST + `text/event-stream`).
+    /// Overall timeout for Chat run SSE (`GET /api/runs/{id}?since=`).
     /// Must be minutes-long: a GET/write timeout would kill the composer mid-run.
     pub stream_timeout: Duration,
     pub probe_timeout: Duration,

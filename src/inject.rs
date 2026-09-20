@@ -1,15 +1,21 @@
-//! Rust inject for Chat AG-UI (not Level / Sprites / Bestiary / S3).
+//! Rust inject for Chat HTML only (not Level / Sprites / Bestiary / S3).
 //!
-//! Chat HTML is rewritten so HttpAgent / `fetch` of `text/event-stream` hits the
-//! studio-owned loopback streamer instead of the live origin (WebView cookies
-//! are unused). The SSE body itself is never rewritten or cached.
+//! Live `chat.mcpwork.space` is a Next.js Longgraph shell. The composer does
+//! `POST /api/agent/{id}` with JSON and gets `202 {"runId","threadId"}`. The
+//! run itself is `GET /api/runs/{uuid}?since=` with `Accept: text/event-stream`,
+//! parsed from `fetch().body` (not `EventSource`, not CopilotKit `HttpAgent`,
+//! not protobuf). Those paths are relative, so the Chat loopback proxy already
+//! sees them. This module only:
+//! - marks Chat HTML with a small script
+//! - redirects **absolute** chat-origin GET `/api/runs/{uuid}` SSE to the
+//!   studio streamer (WebView cookies are a different jar: Tauri #12988)
 
 use axum::http::HeaderMap;
 
 use crate::config::StudioConfig;
 use crate::proxy::Proxy;
 
-/// Studio-owned AG-UI streamer on the Chat loopback port.
+/// Studio-owned GET `/api/runs/{uuid}` SSE streamer on the Chat loopback port.
 pub const STUDIO_AGUI_PATH: &str = "/api/studio/ag-ui";
 pub const STUDIO_INJECT_JS_PATH: &str = "/api/studio/ag-ui-inject.js";
 
@@ -17,25 +23,27 @@ pub const STUDIO_INJECT_JS_PATH: &str = "/api/studio/ag-ui-inject.js";
 pub const INJECT_MARKER: &str = "data-studio-agui-inject";
 pub const INJECT_SCRIPT_ID: &str = "studio-agui-inject";
 
-/// In-memory static inject script (also stored in [`crate::inject_cache::InjectCache`]).
+/// Safety-net script: relative `/api/runs/…` stays on the loopback proxy.
+/// Absolute chat-origin GET SSE is rewritten to [`STUDIO_AGUI_PATH`].
 pub const INJECT_JS: &str = r#"(function(){
   if (window.__STUDIO_AGUI_INJECT__) return;
   window.__STUDIO_AGUI_INJECT__ = true;
   try { document.documentElement.setAttribute("data-studio-agui-inject","1"); } catch (e) {}
   var EP = location.origin + "/api/studio/ag-ui";
-  function acceptOf(h) {
+  function headerOf(h, name) {
+    name = String(name).toLowerCase();
     if (!h) return "";
     try {
       if (typeof Headers !== "undefined" && h instanceof Headers) {
-        return h.get("accept") || "";
+        return h.get(name) || "";
       }
     } catch (e) {}
     if (typeof h.get === "function") {
-      try { return h.get("accept") || h.get("Accept") || ""; } catch (e) {}
+      try { return h.get(name) || ""; } catch (e) {}
     }
     if (typeof h === "object") {
       for (var k in h) {
-        if (Object.prototype.hasOwnProperty.call(h, k) && String(k).toLowerCase() === "accept") {
+        if (Object.prototype.hasOwnProperty.call(h, k) && String(k).toLowerCase() === name) {
           return String(h[k]);
         }
       }
@@ -66,46 +74,23 @@ pub const INJECT_JS: &str = r#"(function(){
     add(b);
     return out;
   }
-  function headerOf(h, name) {
-    name = String(name).toLowerCase();
-    if (!h) return "";
-    try {
-      if (typeof Headers !== "undefined" && h instanceof Headers) {
-        return h.get(name) || "";
-      }
-    } catch (e) {}
-    if (typeof h.get === "function") {
-      try { return h.get(name) || ""; } catch (e) {}
-    }
-    if (typeof h === "object") {
-      for (var k in h) {
-        if (Object.prototype.hasOwnProperty.call(h, k) && String(k).toLowerCase() === name) {
-          return String(h[k]);
-        }
-      }
-    }
-    return "";
+  function isRunSsePath(pathname) {
+    return /^\/api\/runs\/[0-9a-fA-F-]+$/.test(pathname);
   }
-  function isAgui(url, init, req) {
+  function isAbsoluteRunSse(url, init, req) {
     var method = (init && init.method) || (req && req.method) || "GET";
-    if (String(method).toUpperCase() !== "POST") return false;
+    if (String(method).toUpperCase() !== "GET") return false;
     var a = "";
-    var ct = "";
-    if (init) {
-      a = headerOf(init.headers, "accept");
-      ct = headerOf(init.headers, "content-type");
+    if (init) a = headerOf(init.headers, "accept");
+    if (!a && req) a = headerOf(req.headers, "accept");
+    if (String(a).toLowerCase().indexOf("text/event-stream") < 0) return false;
+    try {
+      var parsed = new URL(url, location.href);
+      if (parsed.origin === location.origin) return false;
+      return isRunSsePath(parsed.pathname);
+    } catch (e) {
+      return false;
     }
-    if (req) {
-      if (!a) a = headerOf(req.headers, "accept");
-      if (!ct) ct = headerOf(req.headers, "content-type");
-    }
-    a = String(a).toLowerCase();
-    ct = String(ct).toLowerCase();
-    var sse = a.indexOf("text/event-stream") >= 0;
-    var proto = a.indexOf("application/vnd.ag-ui.event+proto") >= 0
-      || ct.indexOf("application/vnd.ag-ui.event+proto") >= 0;
-    var json = ct.indexOf("application/json") >= 0;
-    return (sse && json) || proto;
   }
   var origFetch = window.fetch.bind(window);
   window.fetch = function (input, init) {
@@ -119,7 +104,7 @@ pub const INJECT_JS: &str = r#"(function(){
     } else {
       url = String(input);
     }
-    if (!isAgui(url, init, req)) {
+    if (!isAbsoluteRunSse(url, init, req)) {
       return origFetch(input, init);
     }
     var next = {};
@@ -130,13 +115,7 @@ pub const INJECT_JS: &str = r#"(function(){
     }
     next.headers = mergeHeaders(req && req.headers, init && init.headers);
     next.headers.set("X-Studio-Agui-Url", url);
-    if (!next.method) next.method = (req && req.method) || "POST";
-    if (next.body == null && req && req.method !== "GET" && req.method !== "HEAD") {
-      next.body = req.body;
-      if (typeof ReadableStream !== "undefined" && next.body instanceof ReadableStream) {
-        next.duplex = "half";
-      }
-    }
+    next.method = "GET";
     if (req && req.signal && !next.signal) next.signal = req.signal;
     var dest = EP;
     try {
@@ -145,39 +124,15 @@ pub const INJECT_JS: &str = r#"(function(){
     } catch (e) {}
     return origFetch(dest, next);
   };
-  var OrigES = window.EventSource;
-  if (OrigES) {
-    function StudioES(url, cfg) {
-      var u = String(url);
-      if (u.indexOf("/api/studio/ag-ui") >= 0) {
-        return new OrigES(u, cfg);
-      }
-      try {
-        var parsed = new URL(u, location.href);
-        if (parsed.origin !== location.origin) {
-          u = EP + "?to=" + encodeURIComponent(parsed.pathname + parsed.search);
-        }
-      } catch (e) {}
-      return new OrigES(u, cfg);
-    }
-    StudioES.prototype = OrigES.prototype;
-    StudioES.CONNECTING = OrigES.CONNECTING;
-    StudioES.OPEN = OrigES.OPEN;
-    StudioES.CLOSED = OrigES.CLOSED;
-    window.EventSource = StudioES;
-  }
 })();"#;
 
 pub fn inject_snippet(script_src: &str) -> String {
     format!(r#"<script id="{INJECT_SCRIPT_ID}" src="{script_src}" {INJECT_MARKER}></script>"#)
 }
 
-/// Rewrite Chat HTML: HttpAgent origin URLs + inject `<script src>`. Idempotent.
-pub fn inject_chat_html(html: &str, origin: &str) -> String {
-    inject_agui_markup(
-        &rewrite_http_agent_urls(html, origin),
-        STUDIO_INJECT_JS_PATH,
-    )
+/// Inject Chat HTML `<script src>`. Does not rewrite quoted origin URLs.
+pub fn inject_chat_html(html: &str) -> String {
+    inject_agui_markup(html, STUDIO_INJECT_JS_PATH)
 }
 
 pub fn inject_agui_markup(html: &str, script_src: &str) -> String {
@@ -200,38 +155,6 @@ pub fn script_src_for_request(incoming: &HeaderMap) -> String {
     }
 }
 
-/// Quoted absolute Chat-origin URLs that are not static assets become the
-/// studio streamer path (`/api/studio/ag-ui?to=…`).
-pub fn rewrite_http_agent_urls(source: &str, origin: &str) -> String {
-    let origin = origin.trim_end_matches('/');
-    if origin.is_empty() || !source.contains(origin) {
-        return source.to_string();
-    }
-    let mut out = String::with_capacity(source.len());
-    let mut rest = source;
-    while let Some(idx) = rest.find(origin) {
-        out.push_str(&rest[..idx]);
-        let before = if idx > 0 { rest.as_bytes()[idx - 1] } else { 0 };
-        let after_origin = &rest[idx + origin.len()..];
-        if before == b'"' || before == b'\'' {
-            let quote = before as char;
-            let path = take_quoted_path(after_origin, quote);
-            if !is_static_asset(path) {
-                let path = if path.is_empty() { "/" } else { path };
-                out.push_str(STUDIO_AGUI_PATH);
-                out.push_str("?to=");
-                out.push_str(&percent_encode(path));
-                rest = &after_origin[path.len()..];
-                continue;
-            }
-        }
-        out.push_str(origin);
-        rest = after_origin;
-    }
-    out.push_str(rest);
-    out
-}
-
 pub fn is_javascript_content_type(content_type: &str) -> bool {
     let ct = content_type.to_ascii_lowercase();
     ct.contains("javascript") || ct.contains("ecmascript")
@@ -239,6 +162,19 @@ pub fn is_javascript_content_type(content_type: &str) -> bool {
 
 pub fn is_html_content_type_str(content_type: &str) -> bool {
     content_type.to_ascii_lowercase().contains("text/html")
+}
+
+/// Live chat run stream: `GET /api/runs/{uuid}` with optional `?since=`.
+/// Not `/cancel`, not `/scouts/{id}`, not `POST /api/agent/{id}`.
+pub fn is_chat_run_sse_path(path_and_query: &str) -> bool {
+    let p = path_and_query.split('?').next().unwrap_or(path_and_query);
+    let Some(rest) = p.strip_prefix("/api/runs/") else {
+        return false;
+    };
+    if rest.is_empty() || rest.contains('/') {
+        return false;
+    }
+    rest.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
 }
 
 pub fn agui_upstream_path(
@@ -253,7 +189,8 @@ pub fn agui_upstream_path(
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
         .or_else(|| query_to_param(query))?;
-    sanitize_agui_target(&raw, chat_origin)
+    let path = sanitize_agui_target(&raw, chat_origin)?;
+    is_chat_run_sse_path(&path).then_some(path)
 }
 
 fn query_to_param(query: Option<&str>) -> Option<String> {
@@ -296,14 +233,6 @@ pub fn sanitize_agui_target(raw: &str, chat_origin: &str) -> Option<String> {
     Some(Proxy::path_and_query(path, url.query()))
 }
 
-/// Origin path for `POST /api/studio/ag-ui?path=…`. Rejects loops and hosts.
-pub fn sanitize_agui_path(raw: &str) -> String {
-    let decoded = percent_decode(raw);
-    sanitize_agui_target(&decoded, "http://127.0.0.1")
-        .filter(|p| p.starts_with('/'))
-        .unwrap_or_else(|| "/".into())
-}
-
 fn insert_script(html: &str, snippet: &str) -> String {
     let lower = html.to_ascii_lowercase();
     if let Some(inserted) = insert_after_tag(&lower, html, "<head", snippet) {
@@ -327,28 +256,6 @@ fn insert_after_tag(lower: &str, html: &str, tag: &str, snippet: &str) -> Option
     out.push_str(snippet);
     out.push_str(&html[at..]);
     Some(out)
-}
-
-fn take_quoted_path(s: &str, quote: char) -> &str {
-    let end = s.find(quote).unwrap_or(s.len());
-    &s[..end]
-}
-
-fn is_static_asset(path: &str) -> bool {
-    let p = path.split('?').next().unwrap_or(path).to_ascii_lowercase();
-    p.ends_with(".js")
-        || p.ends_with(".css")
-        || p.ends_with(".map")
-        || p.ends_with(".png")
-        || p.ends_with(".jpg")
-        || p.ends_with(".jpeg")
-        || p.ends_with(".gif")
-        || p.ends_with(".svg")
-        || p.ends_with(".webp")
-        || p.ends_with(".ico")
-        || p.ends_with(".woff")
-        || p.ends_with(".woff2")
-        || p.ends_with(".ttf")
 }
 
 pub fn percent_encode(s: &str) -> String {
@@ -396,13 +303,13 @@ mod tests {
     #[test]
     fn inject_marks_html_and_is_idempotent() {
         let html = "<!doctype html><html><head><title>chat</title></head><body>ok</body></html>";
-        let once = inject_chat_html(html, "https://chat.mcpwork.space");
+        let once = inject_chat_html(html);
         assert!(once.contains(INJECT_MARKER));
         assert!(once.contains(INJECT_SCRIPT_ID));
         assert!(once.contains("/api/studio/ag-ui-inject.js"));
         let head = once.split("</head>").next().unwrap();
         assert!(head.contains(INJECT_MARKER));
-        let twice = inject_chat_html(&once, "https://chat.mcpwork.space");
+        let twice = inject_chat_html(&once);
         assert_eq!(
             twice.matches(&format!("id=\"{INJECT_SCRIPT_ID}\"")).count(),
             1
@@ -410,46 +317,106 @@ mod tests {
         assert!(INJECT_JS.contains("__STUDIO_AGUI_INJECT__"));
         assert!(INJECT_JS.contains("X-Studio-Agui-Url"));
         assert!(INJECT_JS.contains("text/event-stream"));
-        assert!(INJECT_JS.contains("application/json"));
-        assert!(!INJECT_JS.contains("looksAguiUrl"));
+        assert!(INJECT_JS.contains("isRunSsePath"));
+        assert!(INJECT_JS.contains("isAbsoluteRunSse"));
+        assert!(INJECT_JS.contains("api\\/runs\\/"));
+        assert!(!INJECT_JS.contains("EventSource"));
+        assert!(!INJECT_JS.contains("vnd.ag-ui"));
+        assert!(!INJECT_JS.contains("HttpAgent"));
+        assert!(!INJECT_JS.contains("copilotkit"));
     }
 
     #[test]
-    fn rewrites_quoted_httpagent_origin_url() {
+    fn does_not_rewrite_quoted_origin_or_invent_copilotkit() {
         let html = r#"<html><head></head><body>
 <script>new HttpAgent({ url: "https://chat.mcpwork.space/api/copilotkit" });</script>
+<script>fetch("/api/agent/game",{method:"POST",headers:{"content-type":"application/json"}});</script>
+<script>fetch("/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7?since=0",{headers:{accept:"text/event-stream"}});</script>
 <img src="https://chat.mcpwork.space/logo.png">
 </body></html>"#;
-        let out = inject_chat_html(html, "https://chat.mcpwork.space");
-        assert!(out.contains("/api/studio/ag-ui?to="));
-        assert!(out.contains(&percent_encode("/api/copilotkit")));
+        let out = inject_chat_html(html);
+        assert!(out.contains(INJECT_MARKER));
         assert!(
-            !out.contains(r#"url: "https://chat.mcpwork.space/api/copilotkit""#),
-            "HttpAgent url must be rewritten: {out}"
+            out.contains(r#"url: "https://chat.mcpwork.space/api/copilotkit""#),
+            "must not invent HttpAgent URL rewrites: {out}"
         );
         assert!(
-            out.contains(r#"https://chat.mcpwork.space/logo.png"#),
-            "static assets stay on origin: {out}"
+            out.contains(r#"/api/agent/game"#),
+            "relative POST /api/agent stays: {out}"
+        );
+        assert!(
+            out.contains(r#"/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7?since=0"#),
+            "relative GET /api/runs stays: {out}"
+        );
+        assert!(
+            !out.contains("/api/studio/ag-ui?to="),
+            "HTML must not rewrite quoted URLs: {out}"
         );
     }
 
     #[test]
-    fn percent_roundtrip_for_path() {
-        let path = "/api/copilotkit?x=1 y";
-        assert_eq!(percent_decode(&percent_encode(path)), path);
+    fn run_sse_path_matches_live_chat_contract() {
+        assert!(is_chat_run_sse_path(
+            "/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7"
+        ));
+        assert!(is_chat_run_sse_path(
+            "/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7?since=0"
+        ));
+        assert!(!is_chat_run_sse_path("/api/runs"));
+        assert!(!is_chat_run_sse_path("/api/runs/"));
+        assert!(!is_chat_run_sse_path(
+            "/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7/cancel"
+        ));
+        assert!(!is_chat_run_sse_path(
+            "/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7/scouts/abc"
+        ));
+        assert!(!is_chat_run_sse_path("/api/agent/game"));
+        assert!(!is_chat_run_sse_path("/api/copilotkit"));
+        assert!(!is_chat_run_sse_path("/agent"));
+        assert!(!is_chat_run_sse_path("/api/threads"));
+    }
+
+    #[test]
+    fn streamer_only_forwards_run_sse_on_chat_origin() {
+        let origin = "https://chat.mcpwork.space";
+        let run = "/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7?since=0";
+        assert_eq!(sanitize_agui_target(run, origin).as_deref(), Some(run));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-studio-agui-url",
+            axum::http::HeaderValue::from_static(
+                "https://chat.mcpwork.space/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7?since=0",
+            ),
+        );
         assert_eq!(
-            sanitize_agui_target("/agent", "https://chat.mcpwork.space").as_deref(),
-            Some("/agent")
+            agui_upstream_path(&headers, None, origin).as_deref(),
+            Some(run)
+        );
+        headers.insert(
+            "x-studio-agui-url",
+            axum::http::HeaderValue::from_static("https://chat.mcpwork.space/api/copilotkit"),
         );
         assert!(
-            sanitize_agui_target(STUDIO_AGUI_PATH, "https://chat.mcpwork.space").is_none(),
-            "must not invent a default AG-UI path"
+            agui_upstream_path(&headers, None, origin).is_none(),
+            "must not forward invented CopilotKit path"
         );
-        assert_eq!(sanitize_agui_path("%2Fagent"), "/agent");
-        assert_eq!(sanitize_agui_path("/api/studio/ag-ui?path=/x"), "/");
+        headers.insert(
+            "x-studio-agui-url",
+            axum::http::HeaderValue::from_static("https://chat.mcpwork.space/api/agent/game"),
+        );
         assert!(
-            sanitize_agui_target("https://evil.example/x", "https://chat.mcpwork.space").is_none()
+            agui_upstream_path(&headers, None, origin).is_none(),
+            "POST /api/agent is JSON 202, not the SSE streamer"
         );
-        assert!(sanitize_agui_target("/ok/../secret", "https://chat.mcpwork.space").is_none());
+        assert!(agui_upstream_path(&HeaderMap::new(), Some("to=/agent"), origin).is_none());
+        assert!(sanitize_agui_target(STUDIO_AGUI_PATH, origin).is_none());
+        assert!(sanitize_agui_target("https://evil.example/x", origin).is_none());
+        assert!(sanitize_agui_target("/ok/../secret", origin).is_none());
+        assert_eq!(
+            percent_decode(&percent_encode(
+                "/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7?since=0"
+            )),
+            "/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7?since=0"
+        );
     }
 }
