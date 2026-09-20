@@ -2,10 +2,9 @@
 //!
 //! Docs: <https://api.goauthentik.io/flow-executor>
 //!
-//! Expected stages: identification → password. This desk never prompts for
-//! TOTP, never RFC6238-generates a code, and never stores a TOTP seed. If the
-//! executor hits `ak-stage-authenticator-validate`, tell the user to finish
-//! session/TOTP once on auth.mcpwork.space.
+//! Expected stages: identification → password. This Authentik does not use
+//! TOTP. The desk never prompts for a second factor, never generates a code,
+//! and never stores a TOTP seed. Authenticator stages are a misconfiguration.
 //!
 //! One `reqwest` cookie jar for the whole hop chain. If cookies are dropped,
 //! Authentik starts a new flow plan and the first challenge comes back again.
@@ -167,10 +166,10 @@ fn is_forbidden_totp_stage(component: &str) -> bool {
     c.contains("authenticator-validate") || c.contains("authenticator-totp") || c.contains("totp")
 }
 
-/// Never prompt, never RFC6238-generate a code, never persist a TOTP seed.
+/// Never prompt, never generate a code, never persist a TOTP seed.
 fn totp_forbidden(component: &str) -> String {
     format!(
-        "Сессию или TOTP нужно один раз завершить на auth.mcpwork.space (`{component}`). Повторный вход здесь — только логин и пароль."
+        "неподдерживаемая стадия Authentik `{component}`. Вход только логин и пароль."
     )
 }
 
@@ -503,11 +502,11 @@ mod tests {
             "device_challenges": [{ "device_class": "totp" }]
         });
         let err = decide_stage(&challenge, "u", "p", &posted(), FLOW).unwrap_err();
-        assert!(err.contains("auth.mcpwork.space"));
+        assert!(err.contains("неподдерживаемая стадия"));
         assert!(err.contains("логин и пароль"));
         assert!(err.contains("ak-stage-authenticator-validate"));
         assert!(!err.contains("введите код"));
-        assert!(!err.contains("misconfigured"));
+        assert!(!err.contains("auth.mcpwork.space"));
         assert!(matches!(
             decide_stage(&challenge, "u", "p", &posted(), FLOW),
             Err(_)
@@ -522,9 +521,9 @@ mod tests {
             "secret_key": "JBSWY3DPEHPK3PXP"
         });
         let err = decide_stage(&challenge, "u", "p", &posted(), FLOW).unwrap_err();
-        assert!(err.contains("auth.mcpwork.space"));
+        assert!(err.contains("неподдерживаемая стадия"));
         assert!(err.contains("ak-stage-authenticator-totp"));
-        assert!(!err.contains("misconfigured"));
+        assert!(!err.contains("auth.mcpwork.space"));
         assert!(!err.contains("JBSWY3DPEHPK3PXP"));
         assert!(!err.contains("otpauth"));
         assert!(!err.contains("завести TOTP"));

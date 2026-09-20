@@ -6,9 +6,8 @@
 //! Manager, macOS Keychain, Linux Secret Service, Android Keystore. Ciphertext
 //! sits next to remember meta (`remembered_session.bin`, unix 0600).
 //!
-//! Passwords are not stored. TOTP seeds are not stored. The gate has no TOTP
-//! field — if Authentik still wants `ak-stage-authenticator-validate`, finish
-//! that once in the browser on auth.mcpwork.space.
+//! Passwords are not stored. This Authentik has no TOTP; the gate has no
+//! second-factor field and no TOTP seed is kept.
 
 use std::fs;
 use std::path::{Path, PathBuf};

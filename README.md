@@ -32,7 +32,7 @@ You do not need npm, cargo, or a UI packaging script.
 
 This repo is chrome-only. Hashed Vite SPAs under `ui/level`, `ui/sprites`, `ui/bestiary` must not be committed. After login the iframe hits `/stand/<slug>/<app>/` for editors; Chat / S3 iframes hit extra `127.0.0.1` ports (same Authentik jar). Axum fills editor overlay from the stand.
 
-Authentik login in this desk is username + password (no TOTP field). «Запомнить» encrypts the cookie jar with AES-256-GCM (key in the OS keyring, ciphertext under `cache_dir`). A still-valid Authentik session skips the gate. If the executor returns `ak-stage-authenticator-validate`, finish session/TOTP once on auth.mcpwork.space — this app will not prompt for a code.
+Authentik login in this desk is username + password. «Запомнить» encrypts the cookie jar with AES-256-GCM (key in the OS keyring, ciphertext under `cache_dir`). A still-valid Authentik session skips the gate.
 
 ```bash
 cargo +1.95 run -- --no-window   # proxy only
