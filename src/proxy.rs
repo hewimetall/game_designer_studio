@@ -380,7 +380,6 @@ fn error_json(status: StatusCode, message: &str) -> axum::response::Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::build_client;
     use std::sync::Arc;
     use tokio::runtime::Runtime;
 
@@ -394,12 +393,7 @@ mod tests {
 
     fn dummy_session() -> Session {
         let jar = Arc::new(reqwest::cookie::Jar::default());
-        Session {
-            slug: "s".into(),
-            username: "u".into(),
-            client: build_client(jar.clone()).unwrap(),
-            jar,
-        }
+        Session::new("s".into(), "u".into(), jar).unwrap()
     }
 
     fn seed_bestiary(cache: &ReadCache) -> String {

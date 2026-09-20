@@ -2,6 +2,10 @@
 //!
 //! Docs: <https://api.goauthentik.io/flow-executor>
 //!
+//! Expected stages: identification → password. This Authentik does not use
+//! TOTP. The desk never prompts for a second factor, never generates a code,
+//! and never stores a TOTP seed. Authenticator stages are a misconfiguration.
+//!
 //! One `reqwest` cookie jar for the whole hop chain. If cookies are dropped,
 //! Authentik starts a new flow plan and the first challenge comes back again.
 
@@ -21,7 +25,6 @@ const EXECUTOR_TIMEOUT: Duration = Duration::from_secs(20);
 struct PostedStages {
     identification: bool,
     password: bool,
-    totp: bool,
 }
 
 #[derive(Debug)]
@@ -35,7 +38,6 @@ pub async fn login_with_password(
     slug: &str,
     username: &str,
     password: &str,
-    totp: Option<&str>,
 ) -> Result<Session, String> {
     let jar = Arc::new(Jar::default());
     let client = build_client(jar.clone())?;
@@ -46,14 +48,7 @@ pub async fn login_with_password(
     let mut challenge = executor_get(&client, &url, &next).await?;
     let mut posted = PostedStages::default();
     for _ in 0..8 {
-        match decide_stage(
-            &challenge,
-            username,
-            password,
-            totp,
-            &posted,
-            &cfg.flow_slug,
-        )? {
+        match decide_stage(&challenge, username, password, &posted, &cfg.flow_slug)? {
             StageMove::Post(body) => {
                 mark_posted(&mut posted, &body);
                 challenge = executor_post(&client, &url, &next, body).await?;
@@ -61,17 +56,25 @@ pub async fn login_with_password(
             StageMove::Redirect { to } => {
                 follow_flow_redirect(&client, cfg, to.as_deref()).await;
                 let who = verify_authentik_user(&client, cfg).await?;
+                // Cheap stand GET so the outpost cookie lands. Chat/S3 settle is
+                // background work after login returns JSON.
                 settle_stand_cookie(&client, cfg, slug).await?;
-                return Ok(Session {
-                    slug: slug.to_string(),
-                    username: who,
-                    client,
-                    jar,
-                });
+                return Session::new(slug.to_string(), who, jar);
             }
         }
     }
     Err("Authentik: слишком много стадий".into())
+}
+
+/// Rebuild a Session from a persisted jar if Authentik still knows it.
+pub async fn resume_from_jar(
+    cfg: &StudioConfig,
+    slug: &str,
+    jar: Arc<Jar>,
+) -> Result<Session, String> {
+    let client = build_client(jar.clone())?;
+    let who = verify_authentik_user_timed(&client, cfg, cfg.probe_timeout).await?;
+    Session::new(slug.to_string(), who, jar)
 }
 
 /// Check `response_errors` / deny / restart **before** posting again.
@@ -79,7 +82,6 @@ fn decide_stage(
     challenge: &Value,
     username: &str,
     password: &str,
-    totp: Option<&str>,
     posted: &PostedStages,
     flow_slug: &str,
 ) -> Result<StageMove, String> {
@@ -120,20 +122,6 @@ fn decide_stage(
                 "password": password,
             })))
         }
-        "ak-stage-authenticator-validate" => {
-            if posted.totp {
-                return Err("Authentik: code: неверный код TOTP".into());
-            }
-            let code = totp.ok_or_else(|| totp_needed(challenge))?;
-            Ok(StageMove::Post(json!({
-                "component": "ak-stage-authenticator-validate",
-                "code": code,
-            })))
-        }
-        "ak-stage-authenticator-totp" => Err(
-            "Authentik просит завести TOTP. Один раз настройте его в браузере на auth.mcpwork.space, затем введите код сюда."
-                .into(),
-        ),
         "ak-stage-access-denied" => Err(access_denied_message(challenge)),
         "xak-flow-redirect" => Ok(StageMove::Redirect {
             to: challenge
@@ -148,6 +136,7 @@ fn decide_stage(
                 Err("Authentik вернул пустой challenge".into())
             }
         }
+        other if is_forbidden_totp_stage(other) => Err(totp_forbidden(other)),
         other => Err(format!(
             "неподдерживаемая стадия Authentik `{other}`. В браузере это /if/flow/{flow_slug}/"
         )),
@@ -158,9 +147,18 @@ fn mark_posted(posted: &mut PostedStages, body: &Value) {
     match body.get("component").and_then(Value::as_str) {
         Some("ak-stage-identification") => posted.identification = true,
         Some("ak-stage-password") => posted.password = true,
-        Some("ak-stage-authenticator-validate") => posted.totp = true,
         _ => {}
     }
+}
+
+fn is_forbidden_totp_stage(component: &str) -> bool {
+    let c = component.to_ascii_lowercase();
+    c.contains("authenticator-validate") || c.contains("authenticator-totp") || c.contains("totp")
+}
+
+/// Never prompt, never generate a code, never persist a TOTP seed.
+fn totp_forbidden(component: &str) -> String {
+    format!("неподдерживаемая стадия Authentik `{component}`. Вход только логин и пароль.")
 }
 
 fn access_denied_message(challenge: &Value) -> String {
@@ -260,10 +258,18 @@ async fn verify_authentik_user(
     client: &reqwest::Client,
     cfg: &StudioConfig,
 ) -> Result<String, String> {
+    verify_authentik_user_timed(client, cfg, EXECUTOR_TIMEOUT).await
+}
+
+async fn verify_authentik_user_timed(
+    client: &reqwest::Client,
+    cfg: &StudioConfig,
+    timeout: Duration,
+) -> Result<String, String> {
     let res = client
         .get(cfg.whoami_url())
         .header("Accept", "application/json")
-        .timeout(EXECUTOR_TIMEOUT)
+        .timeout(timeout)
         .send()
         .await
         .map_err(|err| format!("Authentik /users/me: {err}"))?;
@@ -326,26 +332,6 @@ async fn settle_stand_cookie(
     Ok(())
 }
 
-fn totp_needed(challenge: &Value) -> String {
-    let classes: Vec<&str> = challenge
-        .get("device_challenges")
-        .and_then(Value::as_array)
-        .map(|rows| {
-            rows.iter()
-                .filter_map(|row| row.get("device_class").and_then(Value::as_str))
-                .collect()
-        })
-        .unwrap_or_default();
-    if classes.is_empty() || classes.iter().any(|c| *c == "totp") {
-        "нужен код TOTP (тот же, что на auth.mcpwork.space)".into()
-    } else {
-        format!(
-            "нужен второй фактор ({}), локальный стол принимает только TOTP",
-            classes.join(", ")
-        )
-    }
-}
-
 pub fn response_error_message(challenge: &Value) -> Option<String> {
     let errors = challenge.get("response_errors")?;
     if errors.is_null() {
@@ -380,7 +366,6 @@ fn localize_ak_error(text: &str) -> String {
     match text {
         "Invalid password" => "неверный пароль".into(),
         "Failed to authenticate" => "не удалось аутентифицироваться".into(),
-        "Invalid code" => "неверный код TOTP".into(),
         other => other.to_string(),
     }
 }
@@ -432,7 +417,7 @@ mod tests {
             response_error_message(&challenge).as_deref(),
             Some("Authentik: password: неверный пароль")
         );
-        let err = decide_stage(&challenge, "akadmin", "bad", None, &posted(), FLOW).unwrap_err();
+        let err = decide_stage(&challenge, "akadmin", "bad", &posted(), FLOW).unwrap_err();
         assert_eq!(err, "Authentik: password: неверный пароль");
     }
 
@@ -441,10 +426,10 @@ mod tests {
         let challenge = json!({ "component": "ak-stage-password" });
         let mut seen = posted();
         seen.password = true;
-        let err = decide_stage(&challenge, "u", "p", None, &seen, FLOW).unwrap_err();
+        let err = decide_stage(&challenge, "u", "p", &seen, FLOW).unwrap_err();
         assert!(err.contains("неверный пароль"));
         assert!(matches!(
-            decide_stage(&challenge, "u", "p", None, &posted(), FLOW).unwrap(),
+            decide_stage(&challenge, "u", "p", &posted(), FLOW).unwrap(),
             StageMove::Post(_)
         ));
     }
@@ -454,7 +439,7 @@ mod tests {
         let challenge = json!({ "component": "ak-stage-identification" });
         let mut seen = posted();
         seen.identification = true;
-        let err = decide_stage(&challenge, "u", "p", None, &seen, FLOW).unwrap_err();
+        let err = decide_stage(&challenge, "u", "p", &seen, FLOW).unwrap_err();
         assert!(err.contains("cookie jar"));
     }
 
@@ -464,7 +449,7 @@ mod tests {
             "component": "ak-stage-access-denied",
             "error_message": "nope"
         });
-        let err = decide_stage(&challenge, "u", "p", None, &posted(), FLOW).unwrap_err();
+        let err = decide_stage(&challenge, "u", "p", &posted(), FLOW).unwrap_err();
         assert!(err.contains("access denied"));
         assert!(err.contains("nope"));
     }
@@ -482,8 +467,8 @@ mod tests {
     fn redirect_to_stand_path_uses_stand_origin() {
         let c = cfg();
         assert_eq!(
-            resolve_flow_redirect(&c, Some("/stand/neweditor/")),
-            Some("https://my.mcpwork.space/stand/neweditor/".into())
+            resolve_flow_redirect(&c, Some("/stand/cursorgo/")),
+            Some("https://my.mcpwork.space/stand/cursorgo/".into())
         );
         assert_eq!(
             resolve_flow_redirect(&c, Some("/if/flow/default-authentication-flow/")),
@@ -499,12 +484,38 @@ mod tests {
     }
 
     #[test]
-    fn totp_prompt_mentions_device_class() {
-        let webauthn = json!({
-            "device_challenges": [{ "device_class": "webauthn" }]
+    fn authenticator_validate_is_a_clear_error_without_posting() {
+        let challenge = json!({
+            "component": "ak-stage-authenticator-validate",
+            "device_challenges": [{ "device_class": "totp" }]
         });
-        assert!(totp_needed(&webauthn).contains("webauthn"));
-        assert!(totp_needed(&json!({})).contains("TOTP"));
+        let err = decide_stage(&challenge, "u", "p", &posted(), FLOW).unwrap_err();
+        assert!(err.contains("неподдерживаемая стадия"));
+        assert!(err.contains("логин и пароль"));
+        assert!(err.contains("ak-stage-authenticator-validate"));
+        assert!(!err.contains("введите код"));
+        assert!(!err.contains("auth.mcpwork.space"));
+        assert!(matches!(
+            decide_stage(&challenge, "u", "p", &posted(), FLOW),
+            Err(_)
+        ));
+    }
+
+    #[test]
+    fn totp_enroll_errors_without_leaking_seed() {
+        let challenge = json!({
+            "component": "ak-stage-authenticator-totp",
+            "config_url": "otpauth://totp/Authentik:akadmin?secret=JBSWY3DPEHPK3PXP",
+            "secret_key": "JBSWY3DPEHPK3PXP"
+        });
+        let err = decide_stage(&challenge, "u", "p", &posted(), FLOW).unwrap_err();
+        assert!(err.contains("неподдерживаемая стадия"));
+        assert!(err.contains("ak-stage-authenticator-totp"));
+        assert!(!err.contains("auth.mcpwork.space"));
+        assert!(!err.contains("JBSWY3DPEHPK3PXP"));
+        assert!(!err.contains("otpauth"));
+        assert!(!err.contains("завести TOTP"));
+        assert!(!err.contains("введите код"));
     }
 
     #[test]
@@ -527,7 +538,7 @@ mod tests {
     #[test]
     fn unsupported_stage_does_not_invent_a_post() {
         let challenge = json!({ "component": "ak-stage-captcha" });
-        let err = decide_stage(&challenge, "u", "p", None, &posted(), FLOW).unwrap_err();
+        let err = decide_stage(&challenge, "u", "p", &posted(), FLOW).unwrap_err();
         assert!(err.contains("ak-stage-captcha"));
     }
 
@@ -542,11 +553,10 @@ mod tests {
         }
         let username =
             std::env::var("DESIGNER_STUDIO_LIVE_USER").unwrap_or_else(|_| "akadmin".into());
-        let slug =
-            std::env::var("DESIGNER_STUDIO_LIVE_SLUG").unwrap_or_else(|_| "neweditor".into());
+        let slug = std::env::var("DESIGNER_STUDIO_LIVE_SLUG").unwrap_or_else(|_| "cursorgo".into());
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let session = login_with_password(&cfg(), &slug, &username, &password, None)
+            let session = login_with_password(&cfg(), &slug, &username, &password)
                 .await
                 .expect("live Authentik login");
             assert_eq!(session.username, username);

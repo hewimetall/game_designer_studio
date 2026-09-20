@@ -7,13 +7,17 @@ mod auth;
 mod cache;
 mod config;
 mod host;
+mod inject;
+mod inject_cache;
 mod progress;
 mod proxy;
+mod remember;
 mod session;
 mod slug;
+mod sso;
 mod stand;
 
-pub use apps::DesignerTab;
+pub use apps::{DesignerTab, SystemTab};
 pub use config::{default_ui_dir, StudioConfig};
 pub use host::{bind_local_host, LocalHost};
 pub use progress::{attach_tauri_emitter, Progress, ProgressHub, STUDIO_PROGRESS_EVENT};

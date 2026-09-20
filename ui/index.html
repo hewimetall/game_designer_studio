@@ -139,14 +139,19 @@
         place-items: center;
         padding: 24px;
       }
-      form {
-        width: min(420px, 100%);
+      .gate form {
+        width: min(380px, 100%);
         display: grid;
-        gap: 10px;
+        gap: 12px;
+        padding: 20px 22px 18px;
+        background: var(--ink);
+        border: 2px solid var(--sodium);
+        box-shadow: 0 0 0 1px #000, 0 18px 48px rgba(0, 0, 0, 0.55);
       }
-      label { font-size: 13px; letter-spacing: 0.06em; }
-      .gate button, .gate input {
+      .gate label { font-size: 13px; letter-spacing: 0.06em; }
+      .gate button, .gate input:not([type="checkbox"]) {
         min-height: 44px;
+        min-width: 44px;
         padding: 8px 10px;
       }
       .gate button {
@@ -155,6 +160,63 @@
         text-transform: uppercase;
       }
       .gate input { width: 100%; }
+      .identity { display: grid; gap: 12px; }
+      .gate .stand {
+        color: var(--mute);
+        font-size: 11px;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+      .stand input {
+        border-color: var(--mute);
+        font-size: 13px;
+        letter-spacing: 0.04em;
+        text-transform: none;
+      }
+      .secret input {
+        border-style: solid;
+        border-color: var(--ticket);
+      }
+      .known {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        min-height: 44px;
+        color: var(--mute);
+        letter-spacing: 0.04em;
+        border-bottom: 1px dashed var(--mute);
+      }
+      .known span {
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .known .ghost {
+        margin-left: auto;
+        width: auto;
+        border: 0;
+        color: var(--sodium);
+        letter-spacing: 0.08em;
+      }
+      .known .ghost:hover { color: var(--ticket); }
+      .remember {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        min-height: 44px;
+        cursor: pointer;
+      }
+      .remember input {
+        width: 18px;
+        min-width: 18px;
+        min-height: 18px;
+        accent-color: var(--sodium);
+        cursor: pointer;
+      }
+      .gate .primary {
+        letter-spacing: 0.16em;
+      }
       .err {
         margin: 0;
         padding: 4px 8px;
@@ -235,9 +297,9 @@
   </head>
   <body>
     <header class="ticket">
-      <div class="brand" title="локальный стол · стенд · без Game и A-Life">
+      <div class="brand" title="локальный стол · стенд · Chat / S3 · без Game и A-Life">
         <strong>METRO-ARK</strong>
-        <span class="lede">локальный стол · стенд · без Game и A-Life</span>
+        <span class="lede">локальный стол · стенд · Chat / S3 · без Game и A-Life</span>
         <span class="who" id="who" hidden></span>
       </div>
       <nav class="stations" id="stations" hidden></nav>
@@ -251,11 +313,16 @@
     <p class="err" id="err" role="alert" hidden></p>
     <main class="gate" id="gate">
       <form id="login">
-        <p class="note">Тот же вход, что на <code>auth.mcpwork.space</code>: identification → password → TOTP. Cookie jar в приложении (официальный Flow Executor), не в WebView.</p>
-        <label>Стенд (slug)<input name="slug" required autocomplete="username" placeholder="neweditor" /></label>
-        <label>Логин<input name="username" required autocomplete="username" /></label>
-        <label>Пароль<input name="password" type="password" required autocomplete="current-password" /></label>
-        <label>TOTP, если есть<input name="totp" inputmode="numeric" autocomplete="one-time-code" /></label>
+        <div class="known" id="known" hidden>
+          <span id="knownWho"></span>
+          <button type="button" class="ghost" id="changeId">сменить</button>
+        </div>
+        <div class="identity" id="identity">
+          <label for="username">Логин<input id="username" name="username" required autocomplete="username" /></label>
+        </div>
+        <label class="secret" for="password">Пароль<input id="password" name="password" type="password" required autocomplete="current-password" /></label>
+        <label class="stand" id="standWrap" for="slug">стенд<input id="slug" name="slug" required autocomplete="organization" placeholder="cursorgo" /></label>
+        <label class="remember" title="cookie сессии — AES-GCM, ключ в связке ОС"><input type="checkbox" name="remember" id="remember" /> Запомнить вход на этом компьютере</label>
         <button class="primary" type="submit">Войти</button>
       </form>
     </main>
@@ -279,8 +346,13 @@
       const desks = document.getElementById("desks");
       const err = document.getElementById("err");
       const who = document.getElementById("who");
+      let studioTabs = [];
       const frames = new Map();
       let slug = "";
+
+      function tabPath(tab, nextSlug) {
+        return String((tab && tab.path) || "").replaceAll("{slug}", nextSlug || slug || "");
+      }
       const xfer = document.getElementById("xfer");
       const xferRail = document.getElementById("xferRail");
       const xferLabel = document.getElementById("xferLabel");
@@ -502,6 +574,15 @@
         err.hidden = !text;
       }
 
+      function showIdentity() {
+        const known = document.getElementById("known");
+        const identity = document.getElementById("identity");
+        const stand = document.getElementById("standWrap");
+        if (known) known.hidden = true;
+        if (identity) identity.hidden = false;
+        if (stand) stand.hidden = false;
+      }
+
       function paintMode(data) {
         const offline = !data.online;
         mode.dataset.offline = String(offline);
@@ -524,7 +605,7 @@
           const url = new URL(href, "http://127.0.0.1/");
           const parts = url.pathname.split("/").filter(Boolean);
           const app = parts[0] === "stand" ? parts[2] : parts[0];
-          if (app === "level" || app === "sprites" || app === "bestiary" || app === "game" || app === "alife") {
+          if (app === "level" || app === "sprites" || app === "bestiary" || app === "game" || app === "alife" || app === "chat" || app === "s3") {
             return app;
           }
         } catch (_e) {}
@@ -638,11 +719,11 @@
           });
           desks.appendChild(iframe);
           frames.set(tab.id, iframe);
-          iframe.src = tab.path;
+          iframe.src = tabPath(tab);
         } else if (tab.id === "bestiary") {
           // Sprites save does not notify this desk. Reload so kind→atlas→idle
           // re-fetches instead of keeping the pre-save in-memory snapshot.
-          iframe.src = tab.path;
+          iframe.src = tabPath(tab);
         } else {
           hideTabLoadSoon();
         }
@@ -656,18 +737,19 @@
           who.textContent = username + " · " + nextSlug;
         }
         const studio = await (await fetch("/api/studio")).json();
+        studioTabs = studio.tabs || [];
         stations.innerHTML = "";
-        studio.tabs.forEach((tab, i) => {
+        studioTabs.forEach((tab, i) => {
           const button = document.createElement("button");
           button.className = "station";
           button.type = "button";
           button.dataset.tab = tab.id;
           button.textContent = tab.label;
           button.title = tab.code;
-          const path = "/stand/" + slug + "/" + tab.id + "/";
-          button.addEventListener("click", () => openTab({ id: tab.id, label: tab.label, path }, button));
+          const desk = { id: tab.id, label: tab.label, path: tabPath(tab, nextSlug), kind: tab.kind };
+          button.addEventListener("click", () => openTab(desk, button));
           stations.appendChild(button);
-          if (i === 0) openTab({ id: tab.id, label: tab.label, path }, button);
+          if (i === 0) openTab(desk, button);
         });
         stations.hidden = false;
         sync.hidden = false;
@@ -677,10 +759,41 @@
         await refreshStatus();
       }
 
+      function fillRemembered(s) {
+        const form = document.getElementById("login");
+        if (!form || !s) return;
+        if (s.slug) form.slug.value = s.slug;
+        if (s.username) form.username.value = s.username;
+        form.remember.checked = !!s.remember;
+        const known = document.getElementById("known");
+        const knownWho = document.getElementById("knownWho");
+        const identity = document.getElementById("identity");
+        const stand = document.getElementById("standWrap");
+        if (s.remember && s.slug && s.username && known && knownWho && identity) {
+          knownWho.textContent = s.username + " · " + s.slug;
+          known.hidden = false;
+          identity.hidden = true;
+          if (stand) stand.hidden = true;
+          form.password.focus();
+        }
+      }
+
+      document.getElementById("changeId").addEventListener("click", () => {
+        showIdentity();
+        const slug = document.getElementById("slug");
+        if (slug) slug.focus();
+      });
+
       document.getElementById("login").addEventListener("submit", async (event) => {
         event.preventDefault();
         showErr("");
-        const data = Object.fromEntries(new FormData(event.target));
+        const form = event.target;
+        const data = {
+          slug: form.slug.value,
+          username: form.username.value,
+          password: form.password.value,
+          remember: !!form.remember.checked,
+        };
         const res = await fetch("/api/session/login", {
           method: "POST",
           headers: { "content-type": "application/json" },
@@ -688,7 +801,8 @@
         });
         const json = await res.json();
         if (!res.ok) {
-          showErr(json.error || "вход не удался");
+          const message = json.error || "вход не удался";
+          showErr(message);
           return;
         }
         await showDesk(json.slug, json.username);
@@ -705,7 +819,8 @@
         await refreshStatus();
         const bestiary = frames.get("bestiary");
         if (bestiary) {
-          bestiary.src = "/stand/" + slug + "/bestiary/";
+          const tab = studioTabs.find((item) => item.id === "bestiary");
+          bestiary.src = tabPath(tab || { path: "/stand/{slug}/bestiary/" });
         }
       });
 
@@ -719,7 +834,10 @@
 
       fetch("/api/session")
         .then((r) => r.json())
-        .then((s) => { if (s.authenticated) return showDesk(s.slug, s.username); })
+        .then((s) => {
+          fillRemembered(s);
+          if (s.authenticated) return showDesk(s.slug, s.username);
+        })
         .catch(() => {});
     </script>
   </body>

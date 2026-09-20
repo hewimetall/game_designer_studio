@@ -7,6 +7,14 @@ pub enum DesignerTab {
     Bestiary,
 }
 
+/// System-wide Authentik apps (not stand editors). Own loopback port, `base: "/"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SystemTab {
+    Chat,
+    S3,
+}
+
 impl DesignerTab {
     pub const ALL: [DesignerTab; 3] = [
         DesignerTab::Level,
@@ -46,8 +54,46 @@ impl DesignerTab {
     }
 
     /// Path the bundled Solid editor must see so `apiBasePath()` stays `/stand/<slug>/api`.
+    /// Live human URL is singular `/stand/<slug>/` (HEAD of `/stand/cursorgo/` 302s to
+    /// `/stand/cursorgo/level/`; `/stands/cursorgo/` is Authentik catch-all only).
     pub fn stand_path(self, slug: &str) -> String {
         format!("/stand/{}/{}/", slug, self.id())
+    }
+}
+
+impl SystemTab {
+    pub const ALL: [SystemTab; 2] = [SystemTab::Chat, SystemTab::S3];
+
+    #[inline]
+    pub fn id(self) -> &'static str {
+        match self {
+            SystemTab::Chat => "chat",
+            SystemTab::S3 => "s3",
+        }
+    }
+
+    #[inline]
+    pub fn label(self) -> &'static str {
+        match self {
+            SystemTab::Chat => "Chat",
+            SystemTab::S3 => "S3",
+        }
+    }
+
+    #[inline]
+    pub fn station_code(self) -> &'static str {
+        match self {
+            SystemTab::Chat => "CHT",
+            SystemTab::S3 => "S3",
+        }
+    }
+
+    #[inline]
+    pub fn production_origin(self) -> &'static str {
+        match self {
+            SystemTab::Chat => "https://chat.mcpwork.space",
+            SystemTab::S3 => "https://s3.mcpwork.space",
+        }
     }
 }
 
@@ -66,11 +112,27 @@ mod tests {
     #[test]
     fn stand_paths_keep_slug_prefix_for_existing_web_api_base() {
         assert_eq!(
-            DesignerTab::Level.stand_path("neweditor"),
-            "/stand/neweditor/level/"
+            DesignerTab::Level.stand_path("cursorgo"),
+            "/stand/cursorgo/level/"
         );
         assert!(DesignerTab::Sprites
-            .stand_path("neweditor")
-            .starts_with("/stand/neweditor/"));
+            .stand_path("cursorgo")
+            .starts_with("/stand/cursorgo/"));
+    }
+
+    #[test]
+    fn system_tabs_are_chat_and_s3_on_dedicated_hosts() {
+        let ids: Vec<_> = SystemTab::ALL.iter().map(|tab| tab.id()).collect();
+        assert_eq!(ids, ["chat", "s3"]);
+        assert_eq!(
+            SystemTab::Chat.production_origin(),
+            "https://chat.mcpwork.space"
+        );
+        assert_eq!(
+            SystemTab::S3.production_origin(),
+            "https://s3.mcpwork.space"
+        );
+        assert!(DesignerTab::from_id("chat").is_none());
+        assert!(DesignerTab::from_id("s3").is_none());
     }
 }

@@ -5,13 +5,13 @@ use std::path::PathBuf;
 use clap::Parser;
 use designer_studio_lib::{
     attach_tauri_emitter, await_loopback, bind_local_host, default_ui_dir, DesignerTab,
-    ProgressHub, StudioConfig,
+    ProgressHub, StudioConfig, SystemTab,
 };
 
 #[derive(Parser)]
 #[command(
     name = "designer_studio",
-    about = "Локальный стол METRO-ARK: Level / Sprites / Bestiary через стенд. Без Game и A-Life."
+    about = "Локальный стол METRO-ARK: Level / Sprites / Bestiary через стенд, Chat / S3 через общий SSO. Вход: логин и пароль, без TOTP. Без Game и A-Life."
 )]
 struct Args {
     #[arg(long, default_value_t = 18765)]
@@ -36,9 +36,14 @@ fn main() {
     let chrome = host.chrome_url();
     await_loopback(host.addr);
     eprintln!(
-        "METRO-ARK Studio {} вкладки: {}",
+        "METRO-ARK Studio {} вкладки: {}, {}",
         chrome,
         DesignerTab::ALL
+            .iter()
+            .map(|tab| tab.id())
+            .collect::<Vec<_>>()
+            .join(", "),
+        SystemTab::ALL
             .iter()
             .map(|tab| tab.id())
             .collect::<Vec<_>>()

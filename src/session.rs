@@ -10,11 +10,25 @@ pub struct Session {
     pub slug: String,
     pub username: String,
     pub client: Client,
+    /// Same cookie jar, gzip disabled. reqwest `gzip(true)` waits for a gzip
+    /// footer, so it cannot be used for live `text/event-stream` / `/api/runs`.
+    pub stream_client: Client,
     /// Same Arc given to `Client::cookie_provider`. Kept on the session so the
     /// jar cannot be dropped while Authentik/outpost cookies are still needed.
     /// WebView cookies are a different jar (Tauri #12988 / #13045).
-    #[allow(dead_code)]
     pub jar: Arc<Jar>,
+}
+
+impl Session {
+    pub fn new(slug: String, username: String, jar: Arc<Jar>) -> Result<Self, String> {
+        Ok(Self {
+            slug,
+            username,
+            client: build_client(jar.clone())?,
+            stream_client: build_stream_client(jar.clone())?,
+            jar,
+        })
+    }
 }
 
 pub struct LiveState {
@@ -105,11 +119,19 @@ pub struct StatusSnapshot {
 }
 
 pub fn build_client(jar: Arc<Jar>) -> Result<Client, String> {
+    build_client_gzip(jar, true)
+}
+
+pub fn build_stream_client(jar: Arc<Jar>) -> Result<Client, String> {
+    build_client_gzip(jar, false)
+}
+
+fn build_client_gzip(jar: Arc<Jar>, gzip: bool) -> Result<Client, String> {
     Client::builder()
         .cookie_provider(jar)
         .use_rustls_tls()
         .http2_adaptive_window(true)
-        .gzip(true)
+        .gzip(gzip)
         .tcp_nodelay(true)
         .pool_idle_timeout(std::time::Duration::from_secs(30))
         .pool_max_idle_per_host(8)
@@ -135,6 +157,8 @@ mod tests {
     #[test]
     fn rustls_http2_gzip_client_builds_with_cookie_jar() {
         let jar = Arc::new(Jar::default());
-        assert!(build_client(jar).is_ok());
+        assert!(build_client(jar.clone()).is_ok());
+        assert!(build_stream_client(jar.clone()).is_ok());
+        assert!(Session::new("s".into(), "u".into(), jar).is_ok());
     }
 }

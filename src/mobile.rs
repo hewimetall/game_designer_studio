@@ -4,7 +4,7 @@ use tauri::Manager;
 
 use crate::{
     attach_tauri_emitter, await_loopback, bind_local_host, default_ui_dir, DesignerTab,
-    StudioConfig,
+    StudioConfig, SystemTab,
 };
 
 pub fn run_android() {
@@ -19,9 +19,14 @@ pub fn run_android() {
     // Keep the Axum thread alive for the WebView session.
     let _host = host;
     eprintln!(
-        "METRO-ARK Studio {} вкладки: {}",
+        "METRO-ARK Studio {} вкладки: {}, {}",
         chrome,
         DesignerTab::ALL
+            .iter()
+            .map(|tab| tab.id())
+            .collect::<Vec<_>>()
+            .join(", "),
+        SystemTab::ALL
             .iter()
             .map(|tab| tab.id())
             .collect::<Vec<_>>()
@@ -31,6 +36,10 @@ pub fn run_android() {
     let chrome_url = chrome;
     tauri::Builder::default()
         .setup(move |app| {
+            #[cfg(target_os = "android")]
+            {
+                let _ = android_keyring::set_android_keyring_credential_builder();
+            }
             attach_tauri_emitter(app.handle().clone(), &progress);
             if let Some(window) = app.get_webview_window("main") {
                 window.navigate(tauri::Url::parse(&chrome_url)?)?;

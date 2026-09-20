@@ -170,6 +170,8 @@ pub fn health_path(slug: &str) -> String {
 }
 
 pub fn stand_root_path(slug: &str) -> String {
+    // Singular `/stand/` is what the outpost actually serves. Live proof:
+    // HEAD https://my.mcpwork.space/stand/cursorgo/ → 302 /stand/cursorgo/level/
     format!("/stand/{slug}/")
 }
 
@@ -179,12 +181,12 @@ mod tests {
 
     #[test]
     fn prefetch_is_json_only() {
-        let paths = prefetch_json_paths("neweditor");
+        let paths = prefetch_json_paths("cursorgo");
         assert!(paths.iter().all(|p| p.contains("/api/")));
         assert!(paths
             .iter()
             .all(|p| !p.contains("atlas") && !p.contains("file/")));
-        assert!(paths.contains(&"/stand/neweditor/api/bestiary".into()));
+        assert!(paths.contains(&"/stand/cursorgo/api/bestiary".into()));
         assert!(!paths
             .iter()
             .any(|p| p.contains("alife") || p.contains("game")));
@@ -232,12 +234,12 @@ mod tests {
                 "Campfire": {"atlas": "", "slot_anims": {}}
             }
         }"#;
-        let paths = atlas_paths_from_bindings("neweditor", body.as_bytes());
+        let paths = atlas_paths_from_bindings("cursorgo", body.as_bytes());
         assert_eq!(
             paths,
             vec![
-                "/stand/neweditor/api/sprites/atlas/mutant_basic".to_string(),
-                "/stand/neweditor/api/sprites/atlas/матка танк".to_string()
+                "/stand/cursorgo/api/sprites/atlas/mutant_basic".to_string(),
+                "/stand/cursorgo/api/sprites/atlas/матка танк".to_string()
             ]
         );
     }
@@ -261,9 +263,11 @@ mod tests {
         );
         assert!(changed_atlas_get_paths("s", Some(next.as_bytes()), next.as_bytes()).is_empty());
         assert_eq!(
-            slug_from_stand_path("/stand/neweditor/api/sprites"),
-            Some("neweditor")
+            slug_from_stand_path("/stand/cursorgo/api/sprites"),
+            Some("cursorgo")
         );
+        assert_eq!(stand_root_path("cursorgo"), "/stand/cursorgo/");
+        assert!(!stand_root_path("cursorgo").starts_with("/stands/"));
     }
 
     #[test]
