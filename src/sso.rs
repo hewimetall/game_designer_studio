@@ -1124,9 +1124,9 @@ mod tests {
             sanitize_agui_target("https://evil.example/agent", "https://chat.mcpwork.space")
                 .is_none()
         );
-        assert_eq!(
-            sanitize_agui_target(AGUI_ENDPOINT, "https://chat.mcpwork.space").as_deref(),
-            Some("/agent")
+        assert!(
+            sanitize_agui_target(AGUI_ENDPOINT, "https://chat.mcpwork.space").is_none(),
+            "studio streamer path must not loop"
         );
     }
 

@@ -100,10 +100,6 @@ impl InjectObject {
     pub fn fresh(&self) -> bool {
         Instant::now().duration_since(self.stored_at) < self.ttl
     }
-
-    pub fn age_secs(&self) -> u64 {
-        Instant::now().duration_since(self.stored_at).as_secs()
-    }
 }
 
 struct MemEntry {

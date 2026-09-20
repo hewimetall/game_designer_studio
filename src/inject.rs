@@ -149,9 +149,15 @@ pub const INJECT_JS: &str = r#"(function(){
   if (OrigES) {
     function StudioES(url, cfg) {
       var u = String(url);
-      if (u.indexOf("/api/studio/ag-ui") < 0 && looksAguiUrl(u)) {
-        u = EP + "?to=" + encodeURIComponent(u);
+      if (u.indexOf("/api/studio/ag-ui") >= 0) {
+        return new OrigES(u, cfg);
       }
+      try {
+        var parsed = new URL(u, location.href);
+        if (parsed.origin !== location.origin) {
+          u = EP + "?to=" + encodeURIComponent(parsed.pathname + parsed.search);
+        }
+      } catch (e) {}
       return new OrigES(u, cfg);
     }
     StudioES.prototype = OrigES.prototype;
@@ -397,7 +403,10 @@ mod tests {
         let head = once.split("</head>").next().unwrap();
         assert!(head.contains(INJECT_MARKER));
         let twice = inject_chat_html(&once, "https://chat.mcpwork.space");
-        assert_eq!(twice.matches(&format!("id=\"{INJECT_SCRIPT_ID}\"")).count(), 1);
+        assert_eq!(
+            twice.matches(&format!("id=\"{INJECT_SCRIPT_ID}\"")).count(),
+            1
+        );
         assert!(INJECT_JS.contains("__STUDIO_AGUI_INJECT__"));
         assert!(INJECT_JS.contains("X-Studio-Agui-Url"));
         assert!(INJECT_JS.contains("text/event-stream"));
@@ -437,7 +446,7 @@ mod tests {
             "must not invent a default AG-UI path"
         );
         assert_eq!(sanitize_agui_path("%2Fagent"), "/agent");
-        assert_eq!(sanitize_agui_path("/api/studio/ag-ui?path=/x"), "/agent");
+        assert_eq!(sanitize_agui_path("/api/studio/ag-ui?path=/x"), "/");
         assert!(
             sanitize_agui_target("https://evil.example/x", "https://chat.mcpwork.space").is_none()
         );
