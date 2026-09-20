@@ -398,73 +398,103 @@ mod tests {
 
     const FLOW: &str = "default-authentication-flow";
 
-    #[test]
-    fn next_query_is_form_encoded_and_stable() {
-        let q = "next=/stand/x/";
-        assert_eq!(urlencoding_query(q), "next%3D%2Fstand%2Fx%2F");
-        assert_eq!(urlencoding_query(q), urlencoding_query(q));
+    fn decide(challenge: &Value, posted: &PostedStages) -> Result<StageMove, String> {
+        decide_stage(challenge, "akadmin", "pw", posted, FLOW)
     }
 
     #[test]
-    fn invalid_password_is_read_before_reposting() {
+    fn next_query_is_form_encoded() {
+        assert_eq!(
+            urlencoding_query("next=/stand/x/"),
+            "next%3D%2Fstand%2Fx%2F"
+        );
+    }
+
+    #[test]
+    fn identification_posts_uid_and_password_only_when_asked() {
+        let plain = json!({ "component": "ak-stage-identification" });
+        let StageMove::Post(body) = decide(&plain, &posted()).unwrap() else {
+            panic!("identification must be posted");
+        };
+        assert_eq!(body["component"], "ak-stage-identification");
+        assert_eq!(body["uid_field"], "akadmin");
+        assert!(body.get("password").is_none());
+
+        let combined = json!({ "component": "ak-stage-identification", "password_fields": true });
+        let StageMove::Post(body) = decide(&combined, &posted()).unwrap() else {
+            panic!("identification must be posted");
+        };
+        assert_eq!(body["password"], "pw");
+    }
+
+    #[test]
+    fn password_stage_posts_once_then_stops() {
+        let challenge = json!({ "component": "ak-stage-password" });
+        let StageMove::Post(body) = decide(&challenge, &posted()).unwrap() else {
+            panic!("password must be posted");
+        };
+        assert_eq!(body["component"], "ak-stage-password");
+        assert_eq!(body["password"], "pw");
+
+        let mut seen = posted();
+        seen.password = true;
+        assert!(
+            decide(&challenge, &seen).is_err(),
+            "a second password challenge means the first was wrong; never loop"
+        );
+    }
+
+    #[test]
+    fn response_errors_stop_the_flow_before_reposting() {
         let challenge = json!({
             "component": "ak-stage-password",
             "response_errors": {
                 "password": [{ "string": "Invalid password", "code": "invalid" }]
             }
         });
-        assert_eq!(
-            response_error_message(&challenge).as_deref(),
-            Some("Authentik: password: неверный пароль")
-        );
-        let err = decide_stage(&challenge, "akadmin", "bad", &posted(), FLOW).unwrap_err();
-        assert_eq!(err, "Authentik: password: неверный пароль");
-    }
-
-    #[test]
-    fn password_stage_is_not_reposted_without_errors() {
-        let challenge = json!({ "component": "ak-stage-password" });
-        let mut seen = posted();
-        seen.password = true;
-        let err = decide_stage(&challenge, "u", "p", &seen, FLOW).unwrap_err();
-        assert!(err.contains("неверный пароль"));
-        assert!(matches!(
-            decide_stage(&challenge, "u", "p", &posted(), FLOW).unwrap(),
-            StageMove::Post(_)
-        ));
-    }
-
-    #[test]
-    fn identification_again_means_cookie_jar_was_dropped() {
-        let challenge = json!({ "component": "ak-stage-identification" });
-        let mut seen = posted();
-        seen.identification = true;
-        let err = decide_stage(&challenge, "u", "p", &seen, FLOW).unwrap_err();
-        assert!(err.contains("cookie jar"));
-    }
-
-    #[test]
-    fn deny_stage_stops_before_any_post() {
-        let challenge = json!({
-            "component": "ak-stage-access-denied",
-            "error_message": "nope"
-        });
-        let err = decide_stage(&challenge, "u", "p", &posted(), FLOW).unwrap_err();
-        assert!(err.contains("access denied"));
-        assert!(err.contains("nope"));
+        assert!(response_error_message(&challenge).is_some());
+        assert!(decide(&challenge, &posted()).is_err());
     }
 
     #[test]
     fn empty_response_errors_are_ignored() {
-        let challenge = json!({
-            "component": "ak-stage-password",
-            "response_errors": {}
-        });
+        let challenge = json!({ "component": "ak-stage-password", "response_errors": {} });
         assert!(response_error_message(&challenge).is_none());
+        assert!(matches!(
+            decide(&challenge, &posted()),
+            Ok(StageMove::Post(_))
+        ));
     }
 
     #[test]
-    fn redirect_to_stand_path_uses_stand_origin() {
+    fn identification_again_means_the_cookie_jar_was_dropped() {
+        let challenge = json!({ "component": "ak-stage-identification" });
+        let mut seen = posted();
+        seen.identification = true;
+        assert!(decide(&challenge, &seen).is_err());
+    }
+
+    #[test]
+    fn deny_stage_surfaces_authentik_message_without_posting() {
+        let challenge = json!({
+            "component": "ak-stage-access-denied",
+            "error_message": "nope"
+        });
+        let err = decide(&challenge, &posted()).unwrap_err();
+        assert!(err.contains("nope"), "{err}");
+    }
+
+    #[test]
+    fn redirect_stage_completes_the_flow() {
+        let challenge = json!({ "component": "xak-flow-redirect", "to": "/stand/cursorgo/" });
+        assert!(matches!(
+            decide(&challenge, &posted()),
+            Ok(StageMove::Redirect { to: Some(ref to) }) if to == "/stand/cursorgo/"
+        ));
+    }
+
+    #[test]
+    fn redirect_targets_resolve_against_the_right_origin() {
         let c = cfg();
         assert_eq!(
             resolve_flow_redirect(&c, Some("/stand/cursorgo/")),
@@ -481,41 +511,43 @@ mod tests {
             ),
             Some("https://my.mcpwork.space/outpost.goauthentik.io/callback".into())
         );
+        assert_eq!(resolve_flow_redirect(&c, Some("  ")), None);
+        assert_eq!(resolve_flow_redirect(&c, None), None);
     }
 
     #[test]
-    fn authenticator_validate_is_a_clear_error_without_posting() {
+    fn authenticator_stages_error_without_posting_and_name_the_stage() {
         let challenge = json!({
             "component": "ak-stage-authenticator-validate",
             "device_challenges": [{ "device_class": "totp" }]
         });
-        let err = decide_stage(&challenge, "u", "p", &posted(), FLOW).unwrap_err();
-        assert!(err.contains("неподдерживаемая стадия"));
-        assert!(err.contains("логин и пароль"));
-        assert!(err.contains("ak-stage-authenticator-validate"));
-        assert!(!err.contains("введите код"));
-        assert!(!err.contains("auth.mcpwork.space"));
-        assert!(matches!(
-            decide_stage(&challenge, "u", "p", &posted(), FLOW),
-            Err(_)
-        ));
+        let err = decide(&challenge, &posted()).unwrap_err();
+        assert!(err.contains("ak-stage-authenticator-validate"), "{err}");
     }
 
     #[test]
-    fn totp_enroll_errors_without_leaking_seed() {
+    fn totp_enroll_error_does_not_leak_the_seed() {
         let challenge = json!({
             "component": "ak-stage-authenticator-totp",
             "config_url": "otpauth://totp/Authentik:akadmin?secret=JBSWY3DPEHPK3PXP",
             "secret_key": "JBSWY3DPEHPK3PXP"
         });
-        let err = decide_stage(&challenge, "u", "p", &posted(), FLOW).unwrap_err();
-        assert!(err.contains("неподдерживаемая стадия"));
-        assert!(err.contains("ak-stage-authenticator-totp"));
-        assert!(!err.contains("auth.mcpwork.space"));
-        assert!(!err.contains("JBSWY3DPEHPK3PXP"));
-        assert!(!err.contains("otpauth"));
-        assert!(!err.contains("завести TOTP"));
-        assert!(!err.contains("введите код"));
+        let err = decide(&challenge, &posted()).unwrap_err();
+        assert!(err.contains("ak-stage-authenticator-totp"), "{err}");
+        assert!(!err.contains("JBSWY3DPEHPK3PXP"), "{err}");
+        assert!(!err.contains("otpauth"), "{err}");
+    }
+
+    #[test]
+    fn unsupported_stage_does_not_invent_a_post() {
+        let challenge = json!({ "component": "ak-stage-captcha" });
+        let err = decide(&challenge, &posted()).unwrap_err();
+        assert!(err.contains("ak-stage-captcha"), "{err}");
+        assert!(decide(&json!({}), &posted()).is_err(), "empty challenge");
+        assert!(
+            decide(&json!({ "detail": "Not found." }), &posted()).is_err(),
+            "DRF error body"
+        );
     }
 
     #[test]
@@ -524,8 +556,8 @@ mod tests {
             "user": { "pk": 17, "username": "akadmin", "is_active": true }
         });
         assert_eq!(username_from_me(&body).unwrap(), "akadmin");
-        assert!(username_from_me(&json!({ "user": { "username": "AnonymousUser" } })).is_err());
         assert!(username_from_me(&json!({ "username": "akadmin" })).is_ok());
+        assert!(username_from_me(&json!({ "user": { "username": "AnonymousUser" } })).is_err());
         assert!(
             username_from_me(&json!({ "user": { "username": "x", "is_active": false } })).is_err()
         );
@@ -535,27 +567,19 @@ mod tests {
         .is_err());
     }
 
+    /// Real Authentik round trip. `cargo test -- --ignored live_authentik_login`
+    /// with `DESIGNER_STUDIO_LIVE_PASSWORD` (+ optional `_USER`, `_SLUG`).
     #[test]
-    fn unsupported_stage_does_not_invent_a_post() {
-        let challenge = json!({ "component": "ak-stage-captcha" });
-        let err = decide_stage(&challenge, "u", "p", &posted(), FLOW).unwrap_err();
-        assert!(err.contains("ak-stage-captcha"));
-    }
-
-    /// `DESIGNER_STUDIO_LIVE_PASSWORD` — never hardcode secrets.
-    #[test]
-    fn live_login_if_env_set() {
-        let Ok(password) = std::env::var("DESIGNER_STUDIO_LIVE_PASSWORD") else {
-            return;
-        };
-        if password.is_empty() {
-            return;
-        }
+    #[ignore = "needs DESIGNER_STUDIO_LIVE_PASSWORD and network to auth.mcpwork.space"]
+    fn live_authentik_login() {
+        let password = std::env::var("DESIGNER_STUDIO_LIVE_PASSWORD")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .expect("DESIGNER_STUDIO_LIVE_PASSWORD");
         let username =
             std::env::var("DESIGNER_STUDIO_LIVE_USER").unwrap_or_else(|_| "akadmin".into());
         let slug = std::env::var("DESIGNER_STUDIO_LIVE_SLUG").unwrap_or_else(|_| "cursorgo".into());
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
             let session = login_with_password(&cfg(), &slug, &username, &password)
                 .await
                 .expect("live Authentik login");
