@@ -575,6 +575,18 @@ mod tests {
         assert!(html.contains("name=\"remember\""));
         assert!(html.contains("Запомнить вход"));
         assert!(html.contains("fillRemembered"));
+        assert!(html.contains("есть TOTP"));
+        assert!(html.contains("showTotp"));
+        assert!(html.contains("totpNeeded"));
+        assert!(html.contains("id=\"totpWrap\" hidden"));
+        assert!(html.contains("class=\"stand\""));
+        assert!(html.contains("autocomplete=\"organization\""));
+        assert!(html.contains("autocomplete=\"username\""));
+        assert!(html.contains("autocomplete=\"current-password\""));
+        assert!(html.contains("autocomplete=\"one-time-code\""));
+        assert!(html.contains("min-height: 44px"));
+        assert!(!html.contains("TOTP, если есть"));
+        assert!(!html.contains("Стенд (slug)"));
         assert!(html.contains("tabPath"));
         assert!(html.contains("studioTabs"));
         assert!(!html.contains("\"/stand/\" + slug + \"/\" + tab.id"));
@@ -694,6 +706,9 @@ mod tests {
             assert!(home.contains("name=\"remember\""));
             assert!(home.contains("Запомнить вход"));
             assert!(home.contains("fillRemembered"));
+            assert!(home.contains("есть TOTP"));
+            assert!(home.contains("showTotp"));
+            assert!(home.contains("id=\"totpWrap\" hidden"));
             assert!(!home.contains("src=\"/stand"));
             assert!(!home.contains("\"/stand/\" + slug + \"/\" + tab.id"));
 

@@ -139,14 +139,19 @@
         place-items: center;
         padding: 24px;
       }
-      form {
-        width: min(420px, 100%);
+      .gate form {
+        width: min(380px, 100%);
         display: grid;
-        gap: 10px;
+        gap: 12px;
+        padding: 20px 22px 18px;
+        background: var(--ink);
+        border: 2px solid var(--sodium);
+        box-shadow: 0 0 0 1px #000, 0 18px 48px rgba(0, 0, 0, 0.55);
       }
-      label { font-size: 13px; letter-spacing: 0.06em; }
-      .gate button, .gate input {
+      .gate label { font-size: 13px; letter-spacing: 0.06em; }
+      .gate button, .gate input:not([type="checkbox"]) {
         min-height: 44px;
+        min-width: 44px;
         padding: 8px 10px;
       }
       .gate button {
@@ -155,11 +160,59 @@
         text-transform: uppercase;
       }
       .gate input { width: 100%; }
+      .identity { display: grid; gap: 12px; }
+      .gate .stand {
+        color: var(--mute);
+        font-size: 11px;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+      .stand input {
+        border-color: var(--mute);
+        font-size: 13px;
+        letter-spacing: 0.04em;
+        text-transform: none;
+      }
+      .secret input {
+        border-style: solid;
+        border-color: var(--ticket);
+      }
+      .known {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        min-height: 44px;
+        color: var(--mute);
+        letter-spacing: 0.04em;
+        border-bottom: 1px dashed var(--mute);
+      }
+      .known span {
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .known .ghost {
+        margin-left: auto;
+        width: auto;
+        border: 0;
+        color: var(--sodium);
+        letter-spacing: 0.08em;
+      }
+      .totp-open {
+        justify-self: start;
+        width: auto;
+        border: 0;
+        padding: 8px 4px;
+        color: var(--mute);
+        letter-spacing: 0.08em;
+      }
+      .totp-open:hover, .known .ghost:hover { color: var(--ticket); }
       .remember {
         display: flex;
         align-items: center;
         gap: 8px;
-        min-height: 28px;
+        min-height: 44px;
         cursor: pointer;
       }
       .remember input {
@@ -168,6 +221,9 @@
         min-height: 18px;
         accent-color: var(--sodium);
         cursor: pointer;
+      }
+      .gate .primary {
+        letter-spacing: 0.16em;
       }
       .err {
         margin: 0;
@@ -265,11 +321,20 @@
     <p class="err" id="err" role="alert" hidden></p>
     <main class="gate" id="gate">
       <form id="login">
-        <p class="note">Тот же вход, что на <code>auth.mcpwork.space</code>: identification → password → TOTP. Cookie jar в приложении (официальный Flow Executor), не в WebView.</p>
-        <label>Стенд (slug)<input name="slug" required autocomplete="organization" placeholder="neweditor" /></label>
-        <label>Логин<input name="username" required autocomplete="username" /></label>
-        <label>Пароль<input name="password" type="password" required autocomplete="current-password" /></label>
-        <label>TOTP, если есть<input name="totp" inputmode="numeric" autocomplete="one-time-code" /></label>
+        <p class="note">Вход как на <code>auth.mcpwork.space</code>. Cookie jar в приложении, не в WebView.</p>
+        <div class="known" id="known" hidden>
+          <span id="knownWho"></span>
+          <button type="button" class="ghost" id="changeId">сменить</button>
+        </div>
+        <div class="identity" id="identity">
+          <label class="stand" for="slug">стенд<input id="slug" name="slug" required autocomplete="organization" placeholder="neweditor" /></label>
+          <label for="username">Логин<input id="username" name="username" required autocomplete="username" /></label>
+        </div>
+        <label class="secret" for="password">Пароль<input id="password" name="password" type="password" required autocomplete="current-password" /></label>
+        <div class="totp-wrap" id="totpWrap" hidden>
+          <label for="totp">TOTP<input id="totp" name="totp" inputmode="numeric" autocomplete="one-time-code" /></label>
+        </div>
+        <button type="button" class="totp-open" id="totpOpen" aria-expanded="false" aria-controls="totpWrap">есть TOTP</button>
         <label class="remember" title="пароль — в Windows Credential Manager / Android Keystore, не в файле"><input type="checkbox" name="remember" id="remember" /> Запомнить вход на этом компьютере</label>
         <button class="primary" type="submit">Войти</button>
       </form>
@@ -520,6 +585,28 @@
         err.hidden = !text;
       }
 
+      function totpNeeded(text) {
+        return /totp|код/i.test(text || "");
+      }
+
+      function showTotp(focus) {
+        const wrap = document.getElementById("totpWrap");
+        const open = document.getElementById("totpOpen");
+        const field = document.getElementById("totp");
+        if (!wrap || !open || !field) return;
+        wrap.hidden = false;
+        open.hidden = true;
+        open.setAttribute("aria-expanded", "true");
+        if (focus) field.focus();
+      }
+
+      function showIdentity() {
+        const known = document.getElementById("known");
+        const identity = document.getElementById("identity");
+        if (known) known.hidden = true;
+        if (identity) identity.hidden = false;
+      }
+
       function paintMode(data) {
         const offline = !data.online;
         mode.dataset.offline = String(offline);
@@ -703,7 +790,23 @@
         if (s.username) form.username.value = s.username;
         if (s.password) form.password.value = s.password;
         form.remember.checked = !!s.remember;
+        const known = document.getElementById("known");
+        const knownWho = document.getElementById("knownWho");
+        const identity = document.getElementById("identity");
+        if (s.remember && s.slug && s.username && known && knownWho && identity) {
+          knownWho.textContent = s.username + " · " + s.slug;
+          known.hidden = false;
+          identity.hidden = true;
+          form.password.focus();
+        }
       }
+
+      document.getElementById("totpOpen").addEventListener("click", () => showTotp(true));
+      document.getElementById("changeId").addEventListener("click", () => {
+        showIdentity();
+        const slug = document.getElementById("slug");
+        if (slug) slug.focus();
+      });
 
       document.getElementById("login").addEventListener("submit", async (event) => {
         event.preventDefault();
@@ -723,7 +826,9 @@
         });
         const json = await res.json();
         if (!res.ok) {
-          showErr(json.error || "вход не удался");
+          const message = json.error || "вход не удался";
+          showErr(message);
+          if (totpNeeded(message)) showTotp(true);
           return;
         }
         await showDesk(json.slug, json.username);
