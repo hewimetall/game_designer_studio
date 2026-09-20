@@ -6,6 +6,11 @@
 //! Manager, macOS Keychain, Linux Secret Service, Android Keystore. Ciphertext
 //! sits next to remember meta (`remembered_session.bin`, unix 0600).
 //!
+//! Save order keeps keyring and disk consistent: a stored key is reused, so a
+//! re-save is one atomic blob replace (tmp + rename). A fresh key is stored only
+//! after its blob is on disk, and the blob is removed again if the keyring
+//! refuses the key — never a key without its blob or a blob without its key.
+//!
 //! Passwords are not stored. This Authentik has no TOTP; the gate has no
 //! second-factor field and no TOTP seed is kept.
 //!
@@ -144,10 +149,18 @@ pub fn save_session_jar(cache_dir: &Path, jar: &Jar, urls: &[String]) -> Result<
         });
     }
     let plaintext = serde_json::to_vec(&JarDump { cookies }).map_err(|err| err.to_string())?;
-    let key = random_aes_key();
-    set_secret(cache_dir, SESSION_KEY_USER, &hex_encode(&key))?;
+    let stored_key = get_secret(cache_dir, SESSION_KEY_USER).and_then(|hex| hex_decode_key(&hex));
+    let key = stored_key.unwrap_or_else(random_aes_key);
     let blob = encrypt_blob(&plaintext, &key)?;
-    write_private_bytes(&session_blob_path(cache_dir), &blob)
+    let path = session_blob_path(cache_dir);
+    write_private_bytes(&path, &blob)?;
+    if stored_key.is_none() {
+        if let Err(err) = set_secret(cache_dir, SESSION_KEY_USER, &hex_encode(&key)) {
+            let _ = fs::remove_file(&path);
+            return Err(err);
+        }
+    }
+    Ok(())
 }
 
 pub fn load_session_jar(cache_dir: &Path) -> Option<Arc<Jar>> {
@@ -348,7 +361,11 @@ fn ensure_store() {
 fn set_secret(cache_dir: &Path, username: &str, password: &str) -> Result<(), String> {
     #[cfg(test)]
     {
-        test_vault().insert(test_key(cache_dir, username), password.to_string());
+        let mut vault = test_vault();
+        if vault.contains_key(&test_key(cache_dir, TEST_REJECT_SET_SECRET)) {
+            return Err("тестовый keyring отклонил запись".into());
+        }
+        vault.insert(test_key(cache_dir, username), password.to_string());
         return Ok(());
     }
     #[cfg(not(test))]
@@ -390,6 +407,10 @@ fn delete_secret(cache_dir: &Path, username: &str) {
         }
     }
 }
+
+/// Sentinel vault entry (per cache dir) that makes the test `set_secret` fail.
+#[cfg(test)]
+const TEST_REJECT_SET_SECRET: &str = "__reject-set-secret__";
 
 #[cfg(test)]
 fn test_key(cache_dir: &Path, username: &str) -> String {
@@ -559,6 +580,88 @@ mod tests {
             .to_string();
         assert!(auth_header.contains("authentik_session=abc123"));
         assert!(stand_header.contains("ak_outpost=out-9"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn failed_blob_write_does_not_orphan_a_fresh_key() {
+        let dir = temp_dir();
+        // A regular file where the cache dir should be: create_dir_all fails.
+        let blocker = dir.join("not-a-dir");
+        std::fs::write(&blocker, b"x").unwrap();
+        let cache_dir = blocker.join("cache");
+        let jar = Jar::default();
+        let url = Url::parse("https://auth.mcpwork.space/").unwrap();
+        jar.add_cookie_str("authentik_session=secret-cookie; Path=/; Secure", &url);
+        assert!(save_session_jar(&cache_dir, &jar, &cookie_urls()).is_err());
+        assert!(
+            get_secret(&cache_dir, SESSION_KEY_USER).is_none(),
+            "the AES key must reach the keyring only after the blob is on disk"
+        );
+        assert!(!session_blob_path(&cache_dir).exists());
+        assert!(load_session_jar(&cache_dir).is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn keyring_failure_after_blob_write_removes_the_blob() {
+        let dir = temp_dir();
+        test_vault().insert(test_key(&dir, TEST_REJECT_SET_SECRET), String::new());
+        let jar = Jar::default();
+        let url = Url::parse("https://auth.mcpwork.space/").unwrap();
+        jar.add_cookie_str("authentik_session=secret-cookie; Path=/; Secure", &url);
+        let err = save_session_jar(&dir, &jar, &cookie_urls()).unwrap_err();
+        assert!(err.contains("keyring"), "{err}");
+        assert!(
+            !session_blob_path(&dir).exists(),
+            "a blob whose key never reached the keyring must be rolled back"
+        );
+        assert!(!session_blob_path(&dir).with_extension("bin.tmp").exists());
+        assert!(get_secret(&dir, SESSION_KEY_USER).is_none());
+        assert!(load_session_jar(&dir).is_none());
+        test_vault().remove(&test_key(&dir, TEST_REJECT_SET_SECRET));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn resave_reuses_session_key_and_replaces_blob() {
+        let dir = temp_dir();
+        let auth = Url::parse("https://auth.mcpwork.space/").unwrap();
+        // An unusable stored key is replaced, not reused.
+        set_secret(&dir, SESSION_KEY_USER, "not-hex").unwrap();
+        let first = Jar::default();
+        first.add_cookie_str(
+            "authentik_session=first; Path=/; Domain=mcpwork.space; Secure; HttpOnly",
+            &auth,
+        );
+        save_session_jar(&dir, &first, &cookie_urls()).unwrap();
+        let key = get_secret(&dir, SESSION_KEY_USER).expect("fresh key");
+        assert!(
+            hex_decode_key(&key).is_some(),
+            "stored key is 32 hex bytes: {key}"
+        );
+        let first_blob = std::fs::read(session_blob_path(&dir)).unwrap();
+
+        let second = Jar::default();
+        second.add_cookie_str(
+            "authentik_session=second; Path=/; Domain=mcpwork.space; Secure; HttpOnly",
+            &auth,
+        );
+        save_session_jar(&dir, &second, &cookie_urls()).unwrap();
+        assert_eq!(
+            get_secret(&dir, SESSION_KEY_USER).as_deref(),
+            Some(key.as_str()),
+            "re-save keeps the key so replacing the blob is the only step"
+        );
+        assert_ne!(std::fs::read(session_blob_path(&dir)).unwrap(), first_blob);
+        let restored = load_session_jar(&dir).expect("restored jar");
+        let header = CookieStore::cookies(restored.as_ref(), &auth)
+            .expect("auth cookies")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(header.contains("authentik_session=second"), "{header}");
+        assert!(!header.contains("first"), "{header}");
         let _ = std::fs::remove_dir_all(dir);
     }
 
