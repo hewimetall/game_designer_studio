@@ -13,7 +13,6 @@ pub struct Session {
     /// Same Arc given to `Client::cookie_provider`. Kept on the session so the
     /// jar cannot be dropped while Authentik/outpost cookies are still needed.
     /// WebView cookies are a different jar (Tauri #12988 / #13045).
-    #[allow(dead_code)]
     pub jar: Arc<Jar>,
 }
 

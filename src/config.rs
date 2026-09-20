@@ -64,6 +64,17 @@ impl StudioConfig {
         format!("{}/api/v3/core/users/me/", self.auth_origin())
     }
 
+    /// Origins whose cookies (Authentik session + outpost `Domain=mcpwork.space`)
+    /// are snapshotted into the encrypted jar.
+    pub fn cookie_jar_urls(&self) -> Vec<String> {
+        vec![
+            format!("{}/", self.auth_origin()),
+            format!("{}/", self.stand_origin()),
+            format!("{}/", self.origin_for_system(crate::apps::SystemTab::Chat)),
+            format!("{}/", self.origin_for_system(crate::apps::SystemTab::S3)),
+        ]
+    }
+
     /// Host of `https://my.mcpwork.space` / `http://127.0.0.1:9` (port stripped).
     pub fn origin_host(origin: &str) -> Option<&str> {
         let rest = origin
@@ -174,6 +185,15 @@ mod tests {
             "https://auth.mcpwork.space/api/v3/core/users/me/"
         );
         assert_eq!(cfg.auth_origin(), "https://auth.mcpwork.space");
+        assert_eq!(
+            cfg.cookie_jar_urls(),
+            vec![
+                "https://auth.mcpwork.space/".to_string(),
+                "https://my.mcpwork.space/".to_string(),
+                "https://chat.mcpwork.space/".to_string(),
+                "https://s3.mcpwork.space/".to_string(),
+            ]
+        );
         assert_eq!(
             StudioConfig::origin_host("https://my.mcpwork.space"),
             Some("my.mcpwork.space")

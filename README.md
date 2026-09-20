@@ -14,7 +14,7 @@ The NSIS installer does **not** embed WebView2 (`webviewInstallMode: skip`).
 
 1. Download the Windows installer from [Releases](https://github.com/hewimetall/game_designer_studio/releases/latest).
 2. If the window does not open, install the **Evergreen Bootstrapper** (left card) from https://developer.microsoft.com/microsoft-edge/webview2/
-3. Start Studio → stand slug + Authentik login.
+3. Start Studio → login + password (стенд slug). «Запомнить» stores the AES-encrypted cookie jar.
 
 Android: unsigned APK on the same Releases page (sideload; not Play-signed).
 
@@ -31,6 +31,8 @@ You do not need npm, cargo, or a UI packaging script.
 ## Developers
 
 This repo is chrome-only. Hashed Vite SPAs under `ui/level`, `ui/sprites`, `ui/bestiary` must not be committed. After login the iframe hits `/stand/<slug>/<app>/` for editors; Chat / S3 iframes hit extra `127.0.0.1` ports (same Authentik jar). Axum fills editor overlay from the stand.
+
+Authentik login in this desk is username + password (no TOTP field). «Запомнить» encrypts the cookie jar with AES-256-GCM (key in the OS keyring, ciphertext under `cache_dir`). A still-valid Authentik session skips the gate. If the executor returns `ak-stage-authenticator-validate`, finish session/TOTP once on auth.mcpwork.space — this app will not prompt for a code.
 
 ```bash
 cargo +1.95 run -- --no-window   # proxy only

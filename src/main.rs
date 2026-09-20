@@ -11,7 +11,7 @@ use designer_studio_lib::{
 #[derive(Parser)]
 #[command(
     name = "designer_studio",
-    about = "Локальный стол METRO-ARK: Level / Sprites / Bestiary через стенд, Chat / S3 через общий SSO. Без Game и A-Life."
+    about = "Локальный стол METRO-ARK: Level / Sprites / Bestiary через стенд, Chat / S3 через общий SSO. Вход: логин и пароль, без TOTP. Без Game и A-Life."
 )]
 struct Args {
     #[arg(long, default_value_t = 18765)]

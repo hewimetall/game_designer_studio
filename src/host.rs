@@ -17,13 +17,13 @@ use crate::assets::{
     baked_is_packaged, looks_like_packaged_editor, read_chrome, read_spa, refresh_app,
     refresh_app_join, SpaSource,
 };
-use crate::auth::login_with_password;
+use crate::auth::{login_with_password, resume_from_jar};
 use crate::cache::ReadCache;
 use crate::config::StudioConfig;
 use crate::progress::{Progress, ProgressHub};
 use crate::proxy::Proxy;
 use crate::remember::{self, RememberedLogin};
-use crate::session::LiveState;
+use crate::session::{LiveState, Session};
 use crate::slug::parse_slug;
 use crate::sso::{self, SsoBind};
 use crate::stand::{
@@ -91,6 +91,10 @@ pub fn bind_local_host(cfg: StudioConfig) -> Result<LocalHost, String> {
                 let listener = TcpListener::from_std(listener).expect("async listener");
                 let probe = proxy.clone();
                 tokio::spawn(async move { probe_loop(probe).await });
+                let restore = proxy.clone();
+                tokio::spawn(async move {
+                    restore_session_if_needed(&restore).await;
+                });
                 for (bind, std_lis) in sso.iter().cloned().zip(sso_listeners) {
                     let proxy = proxy.clone();
                     tokio::spawn(async move {
@@ -187,6 +191,7 @@ async fn sync_status(State(state): State<AppState>) -> Json<serde_json::Value> {
 }
 
 async fn session_status(State(state): State<AppState>) -> Json<serde_json::Value> {
+    restore_session_if_needed(&state.proxy).await;
     let remembered = remember::load(&state.proxy.cfg.cache_dir);
     match state.proxy.live.session() {
         Some(session) => Json(serde_json::json!({
@@ -197,18 +202,12 @@ async fn session_status(State(state): State<AppState>) -> Json<serde_json::Value
             "remember": remembered.is_some(),
         })),
         None => match remembered {
-            Some(login) => {
-                let mut body = serde_json::json!({
-                    "authenticated": false,
-                    "remember": true,
-                    "slug": login.slug,
-                    "username": login.username,
-                });
-                if !login.password.is_empty() {
-                    body["password"] = serde_json::Value::String(login.password);
-                }
-                Json(body)
-            }
+            Some(login) => Json(serde_json::json!({
+                "authenticated": false,
+                "remember": true,
+                "slug": login.slug,
+                "username": login.username,
+            })),
             None => Json(serde_json::json!({
                 "authenticated": false,
                 "remember": false,
@@ -222,8 +221,6 @@ struct LoginBody {
     slug: String,
     username: String,
     password: String,
-    #[serde(default)]
-    totp: Option<String>,
     #[serde(default)]
     remember: bool,
 }
@@ -243,7 +240,6 @@ async fn login(
         &slug,
         body.username.trim(),
         &body.password,
-        body.totp.as_deref().filter(|s| !s.is_empty()),
     )
     .await
     .map_err(|err| {
@@ -253,37 +249,9 @@ async fn login(
         )
     })?;
     let username = session.username.clone();
-    if body.remember {
-        let _ = remember::save(
-            &state.proxy.cfg.cache_dir,
-            &RememberedLogin {
-                slug: slug.clone(),
-                username: body.username.trim().to_string(),
-                password: body.password,
-            },
-        );
-    } else {
-        remember::clear(&state.proxy.cfg.cache_dir);
-    }
+    persist_or_clear_remember(&state.proxy, &session, body.remember, body.username.trim());
     state.proxy.live.set_session(session);
-    if let Some(session) = state.proxy.live.session() {
-        state.proxy.progress.begin("sync");
-        let mut paths = prefetch_json_paths(&slug);
-        let _ = state.proxy.prefetch_json(&session, &paths).await;
-        if let Some(list) = state.proxy.cache.get(&crate::cache::ReadCache::key(
-            "GET",
-            &format!("/stand/{slug}/api/levels"),
-        )) {
-            paths.extend(level_paths_from_list(&slug, &list.body));
-            let extra: Vec<String> = paths.into_iter().skip(5).collect();
-            let _ = state.proxy.prefetch_json(&session, &extra).await;
-        }
-        let atlas_paths = atlas_prefetch_from_cache(&state.proxy.cache, &slug);
-        if !atlas_paths.is_empty() {
-            let _ = state.proxy.prefetch_json(&session, &atlas_paths).await;
-        }
-        state.proxy.progress.finish();
-    }
+    schedule_post_login_sync(state.proxy.clone(), body.remember);
     Ok(Json(serde_json::json!({
         "ok": true,
         "slug": slug,
@@ -293,8 +261,78 @@ async fn login(
     })))
 }
 
+fn persist_or_clear_remember(proxy: &Proxy, session: &Session, remember: bool, username: &str) {
+    if remember {
+        let _ = remember::save(
+            &proxy.cfg.cache_dir,
+            &RememberedLogin {
+                slug: session.slug.clone(),
+                username: username.to_string(),
+            },
+        );
+        let _ = remember::save_session_jar(
+            &proxy.cfg.cache_dir,
+            session.jar.as_ref(),
+            &proxy.cfg.cookie_jar_urls(),
+        );
+    } else {
+        remember::clear(&proxy.cfg.cache_dir);
+    }
+}
+
+/// Prefetch + Chat/S3 settle run after the login JSON. Do not `.await` this
+/// from the login handler.
+fn schedule_post_login_sync(proxy: Arc<Proxy>, persist_jar: bool) {
+    tokio::spawn(async move {
+        let Some(session) = proxy.live.session() else {
+            return;
+        };
+        crate::sso::settle_system_apps(&session.client, &proxy.cfg).await;
+        if persist_jar {
+            let _ = remember::save_session_jar(
+                &proxy.cfg.cache_dir,
+                session.jar.as_ref(),
+                &proxy.cfg.cookie_jar_urls(),
+            );
+        }
+        proxy.progress.begin("sync");
+        let mut paths = prefetch_json_paths(&session.slug);
+        let _ = proxy.prefetch_json(&session, &paths).await;
+        if let Some(list) = proxy.cache.get(&crate::cache::ReadCache::key(
+            "GET",
+            &format!("/stand/{}/api/levels", session.slug),
+        )) {
+            paths.extend(level_paths_from_list(&session.slug, &list.body));
+            let extra: Vec<String> = paths.into_iter().skip(5).collect();
+            let _ = proxy.prefetch_json(&session, &extra).await;
+        }
+        let atlas_paths = atlas_prefetch_from_cache(&proxy.cache, &session.slug);
+        if !atlas_paths.is_empty() {
+            let _ = proxy.prefetch_json(&session, &atlas_paths).await;
+        }
+        proxy.progress.finish();
+    });
+}
+
+async fn restore_session_if_needed(proxy: &Proxy) {
+    if proxy.live.session().is_some() {
+        return;
+    }
+    let Some(meta) = remember::load(&proxy.cfg.cache_dir) else {
+        return;
+    };
+    let Some(jar) = remember::load_session_jar(&proxy.cfg.cache_dir) else {
+        return;
+    };
+    match resume_from_jar(&proxy.cfg, &meta.slug, jar).await {
+        Ok(session) => proxy.live.set_session(session),
+        Err(_) => remember::clear_session_blob(&proxy.cfg.cache_dir),
+    }
+}
+
 async fn logout(State(state): State<AppState>) -> Json<serde_json::Value> {
     state.proxy.live.clear_session();
+    remember::clear_session_blob(&state.proxy.cfg.cache_dir);
     Json(serde_json::json!({ "ok": true }))
 }
 
@@ -545,6 +583,20 @@ mod tests {
     use super::*;
     use crate::config::StudioConfig;
 
+    fn assert_chrome_has_no_totp(html: &str) {
+        let lower = html.to_ascii_lowercase();
+        assert!(!lower.contains("totp"), "chrome must not mention TOTP");
+        assert!(!html.contains("one-time-code"));
+        assert!(!html.contains("есть TOTP"));
+        assert!(!html.contains("showTotp"));
+        assert!(!html.contains("totpNeeded"));
+        assert!(!html.contains("totpWrap"));
+        assert!(!html.contains("name=\"totp\""));
+        assert!(!html.contains("id=\"totp\""));
+        assert!(!html.contains("form.totp"));
+        assert!(!html.contains("TOTP, если есть"));
+    }
+
     #[test]
     fn spa_rejects_unknown_apps() {
         assert!(DesignerTab::from_id("game").is_none());
@@ -575,17 +627,13 @@ mod tests {
         assert!(html.contains("name=\"remember\""));
         assert!(html.contains("Запомнить вход"));
         assert!(html.contains("fillRemembered"));
-        assert!(html.contains("есть TOTP"));
-        assert!(html.contains("showTotp"));
-        assert!(html.contains("totpNeeded"));
-        assert!(html.contains("id=\"totpWrap\" hidden"));
+        assert!(html.contains("const frames = new Map()"));
+        assert_chrome_has_no_totp(html);
         assert!(html.contains("class=\"stand\""));
         assert!(html.contains("autocomplete=\"organization\""));
         assert!(html.contains("autocomplete=\"username\""));
         assert!(html.contains("autocomplete=\"current-password\""));
-        assert!(html.contains("autocomplete=\"one-time-code\""));
         assert!(html.contains("min-height: 44px"));
-        assert!(!html.contains("TOTP, если есть"));
         assert!(!html.contains("Стенд (slug)"));
         assert!(html.contains("tabPath"));
         assert!(html.contains("studioTabs"));
@@ -706,9 +754,7 @@ mod tests {
             assert!(home.contains("name=\"remember\""));
             assert!(home.contains("Запомнить вход"));
             assert!(home.contains("fillRemembered"));
-            assert!(home.contains("есть TOTP"));
-            assert!(home.contains("showTotp"));
-            assert!(home.contains("id=\"totpWrap\" hidden"));
+            assert_chrome_has_no_totp(&home);
             assert!(!home.contains("src=\"/stand"));
             assert!(!home.contains("\"/stand/\" + slug + \"/\" + tab.id"));
 
@@ -823,7 +869,6 @@ mod tests {
             &RememberedLogin {
                 slug: "neweditor".into(),
                 username: "akadmin".into(),
-                password: "secret".into(),
             },
         )
         .unwrap();
@@ -846,7 +891,7 @@ mod tests {
             assert_eq!(session["remember"], true);
             assert_eq!(session["slug"], "neweditor");
             assert_eq!(session["username"], "akadmin");
-            assert_eq!(session["password"], "secret");
+            assert!(session.get("password").is_none());
 
             remember::clear(&cache);
             let cleared: serde_json::Value = client
@@ -860,6 +905,76 @@ mod tests {
             assert_eq!(cleared["authenticated"], false);
             assert_eq!(cleared["remember"], false);
             assert!(cleared.get("password").is_none());
+        });
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn login_handler_does_not_await_prefetch() {
+        let src = include_str!("host.rs");
+        let login_fn = src
+            .split("async fn login(")
+            .nth(1)
+            .expect("login fn")
+            .split("\nfn persist_or_clear_remember")
+            .next()
+            .expect("login end");
+        assert!(login_fn.contains("schedule_post_login_sync"));
+        assert!(!login_fn.contains("prefetch_json"));
+        assert!(!login_fn.contains("settle_system_apps"));
+        assert!(src.contains("fn schedule_post_login_sync"));
+        assert!(src.contains("tokio::spawn"));
+    }
+
+    #[test]
+    fn expired_or_dummy_session_blob_stays_unauthenticated() {
+        use reqwest::cookie::Jar;
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let root = std::env::temp_dir().join(format!(
+            "designer-session-blob-{}-{}",
+            std::process::id(),
+            stamp
+        ));
+        let ui = root.join("ui");
+        std::fs::create_dir_all(&ui).unwrap();
+        std::fs::write(ui.join("index.html"), include_str!("../ui/index.html")).unwrap();
+        let cache = root.join("cache");
+        remember::save(
+            &cache,
+            &RememberedLogin {
+                slug: "neweditor".into(),
+                username: "akadmin".into(),
+            },
+        )
+        .unwrap();
+        let jar = Jar::default();
+        let url = reqwest::Url::parse("https://auth.mcpwork.space/").unwrap();
+        jar.add_cookie_str("authentik_session=dead-cookie; Path=/; Secure", &url);
+        remember::save_session_jar(&cache, &jar, &["https://auth.mcpwork.space/".into()]).unwrap();
+        let mut cfg = StudioConfig::production(ui, 0, Some(cache.clone()));
+        cfg.probe_timeout = std::time::Duration::from_millis(400);
+        let host = bind_local_host(cfg).expect("bind");
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        let base = host.chrome_url();
+        let rt = Runtime::new().unwrap();
+        rt.block_on(async {
+            let client = reqwest::Client::new();
+            let session: serde_json::Value = client
+                .get(format!("{base}api/session"))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(session["authenticated"], false);
+            assert_eq!(session["remember"], true);
+            assert_eq!(session["slug"], "neweditor");
+            assert_eq!(session["username"], "akadmin");
+            assert!(session.get("password").is_none());
         });
         let _ = std::fs::remove_dir_all(root);
     }
