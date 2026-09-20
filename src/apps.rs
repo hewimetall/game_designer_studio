@@ -115,11 +115,9 @@ mod tests {
             DesignerTab::Level.stand_path("cursorgo"),
             "/stand/cursorgo/level/"
         );
-        assert!(
-            DesignerTab::Sprites
-                .stand_path("cursorgo")
-                .starts_with("/stand/cursorgo/")
-        );
+        assert!(DesignerTab::Sprites
+            .stand_path("cursorgo")
+            .starts_with("/stand/cursorgo/"));
     }
 
     #[test]

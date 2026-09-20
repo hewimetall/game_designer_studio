@@ -99,7 +99,9 @@ pub fn bind_local_host(cfg: StudioConfig) -> Result<LocalHost, String> {
                     let proxy = proxy.clone();
                     tokio::spawn(async move {
                         let listener = TcpListener::from_std(std_lis).expect("sso listener");
-                        let _ = axum::serve(listener, sso::router(proxy, bind.origin)).await;
+                        let _ =
+                            axum::serve(listener, sso::router_for(proxy, bind.origin, bind.tab))
+                                .await;
                     });
                 }
                 axum::serve(listener, router(proxy, sso))
@@ -654,6 +656,7 @@ mod tests {
         assert!(!html.contains("placeholder=\"neweditor\""));
         assert!(!html.contains("src=\"/stand"));
         assert!(!html.contains("game-client"));
+        assert!(!html.contains("data-studio-agui-inject"));
         let placeholder = missing_editor_html("level");
         assert!(placeholder.contains("data-studio-placeholder"));
         assert!(!placeholder.contains("package_designer_studio_ui"));
@@ -759,6 +762,7 @@ mod tests {
             assert_chrome_has_no_totp(&home);
             assert!(!home.contains("src=\"/stand"));
             assert!(!home.contains("\"/stand/\" + slug + \"/\" + tab.id"));
+            assert!(!home.contains("data-studio-agui-inject"));
 
             let no_follow = reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
@@ -856,6 +860,7 @@ mod tests {
                     || body.contains("data-studio-placeholder")
             );
             assert!(!body.contains("/game"));
+            assert!(!body.contains("data-studio-agui-inject"));
         });
         let _ = std::fs::remove_dir_all(root);
     }

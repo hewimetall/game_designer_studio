@@ -7,6 +7,8 @@ mod auth;
 mod cache;
 mod config;
 mod host;
+mod inject;
+mod inject_cache;
 mod progress;
 mod proxy;
 mod remember;

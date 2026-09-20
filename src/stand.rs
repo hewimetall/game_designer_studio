@@ -183,17 +183,13 @@ mod tests {
     fn prefetch_is_json_only() {
         let paths = prefetch_json_paths("cursorgo");
         assert!(paths.iter().all(|p| p.contains("/api/")));
-        assert!(
-            paths
-                .iter()
-                .all(|p| !p.contains("atlas") && !p.contains("file/"))
-        );
+        assert!(paths
+            .iter()
+            .all(|p| !p.contains("atlas") && !p.contains("file/")));
         assert!(paths.contains(&"/stand/cursorgo/api/bestiary".into()));
-        assert!(
-            !paths
-                .iter()
-                .any(|p| p.contains("alife") || p.contains("game"))
-        );
+        assert!(!paths
+            .iter()
+            .any(|p| p.contains("alife") || p.contains("game")));
     }
 
     #[test]

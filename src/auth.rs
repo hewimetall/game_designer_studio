@@ -168,9 +168,7 @@ fn is_forbidden_totp_stage(component: &str) -> bool {
 
 /// Never prompt, never generate a code, never persist a TOTP seed.
 fn totp_forbidden(component: &str) -> String {
-    format!(
-        "неподдерживаемая стадия Authentik `{component}`. Вход только логин и пароль."
-    )
+    format!("неподдерживаемая стадия Authentik `{component}`. Вход только логин и пароль.")
 }
 
 fn access_denied_message(challenge: &Value) -> String {

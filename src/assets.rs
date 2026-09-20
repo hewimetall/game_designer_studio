@@ -889,11 +889,11 @@ mod tests {
     }
 
     async fn spawn_mock_stand(pages: std::collections::HashMap<String, Bytes>) -> String {
-        use axum::Router;
         use axum::extract::State;
         use axum::http::{StatusCode, Uri};
         use axum::response::IntoResponse;
         use axum::routing::get;
+        use axum::Router;
         use std::sync::Arc;
 
         #[derive(Clone)]

@@ -33,6 +33,8 @@ You do not need npm, cargo, or a UI packaging script.
 
 This repo is chrome-only. Hashed Vite SPAs under `ui/level`, `ui/sprites`, `ui/bestiary` must not be committed. After login the iframe hits `/stand/<slug>/<app>/` for editors (live slug `cursorgo`); Chat / S3 iframes hit extra `127.0.0.1` ports (same Authentik jar). Axum fills editor overlay from the stand. Solid `apiBasePath()` stays `/stand/<slug>/api`.
 
+Chat AG-UI is rust-injected into Chat HTML only (HttpAgent/`fetch` rewritten to `POST /api/studio/ag-ui` on the Chat loopback). Injected HTML is cached in a dedicated module; the SSE byte stream is not. The native Authentik cookie jar streams the run (`Accept-Encoding: identity`, 15 min). WebSocket is unused (501).
+
 Authentik login in this desk is username + password. «Запомнить» encrypts the cookie jar with AES-256-GCM (key in the OS keyring, ciphertext under `cache_dir`). A still-valid Authentik session skips the gate.
 
 ```bash
