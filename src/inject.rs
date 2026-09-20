@@ -273,242 +273,142 @@ fn insert_after_tag(lower: &str, html: &str, tag: &str, snippet: &str) -> Option
     Some(out)
 }
 
-pub fn percent_encode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() * 3);
-    for b in s.as_bytes() {
-        match *b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(*b as char);
-            }
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
-}
-
-pub fn percent_decode(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Some(slice) = std::str::from_utf8(&bytes[i + 1..i + 3]).ok() {
-                if let Ok(v) = u8::from_str_radix(slice, 16) {
-                    out.push(v);
-                    i += 3;
-                    continue;
-                }
-            }
-        }
-        if bytes[i] == b'+' {
-            out.push(b' ');
-            i += 1;
-            continue;
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn inject_marks_html_and_is_idempotent() {
-        let html = "<!doctype html><html><head><title>chat</title></head><body>ok</body></html>";
-        let once = inject_chat_html(html);
-        assert!(once.contains(INJECT_MARKER));
-        assert!(once.contains(INJECT_SCRIPT_ID));
-        assert!(once.contains("/api/studio/ag-ui-inject.js"));
-        let head = once.split("</head>").next().unwrap();
-        assert!(head.contains(INJECT_MARKER));
-        let twice = inject_chat_html(&once);
-        assert_eq!(
-            twice.matches(&format!("id=\"{INJECT_SCRIPT_ID}\"")).count(),
-            1
+    const CHAT: &str = "https://chat.mcpwork.space";
+    const RUN: &str = "/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7";
+    const RUN_SINCE: &str = "/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7?since=0";
+
+    fn header(value: &'static str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-studio-agui-url",
+            axum::http::HeaderValue::from_static(value),
         );
-        assert!(INJECT_JS.contains("__STUDIO_AGUI_INJECT__"));
-        assert!(INJECT_JS.contains("window.fetch"));
-        assert!(INJECT_JS.contains("X-Studio-Agui-Url"));
-        assert!(INJECT_JS.contains("isRunSsePath"));
-        assert!(INJECT_JS.contains("isGetRunSse"));
-        assert!(INJECT_JS.contains("return isRunSsePath(parsed.pathname);"));
-        assert!(INJECT_JS.contains("?to="));
-        assert!(INJECT_JS.contains("encodeURIComponent"));
-        assert!(INJECT_JS.contains("api\\/runs\\/"));
-        assert!(INJECT_JS.contains("toUpperCase() !== \"GET\""));
-        assert!(
-            !INJECT_JS.contains("wantsEventStream(init, req) ||"),
-            "Accept: text/event-stream alone must not redirect other Chat SSE to the streamer"
-        );
-        assert!(!INJECT_JS.contains("wantsEventStream"));
-        assert!(!INJECT_JS.contains("headerOf"));
-        assert!(!INJECT_JS.contains("text/event-stream"));
-        assert!(!INJECT_JS.contains("isAbsoluteRunSse"));
-        assert!(!INJECT_JS.contains("EventSource"));
-        assert!(!INJECT_JS.contains("vnd.ag-ui"));
-        assert!(!INJECT_JS.contains("HttpAgent"));
-        assert!(!INJECT_JS.contains("copilotkit"));
-        assert!(!INJECT_JS.contains("parsed.origin === location.origin"));
+        headers
     }
 
     #[test]
-    fn does_not_rewrite_quoted_origin_or_invent_copilotkit() {
+    fn inject_lands_in_head_once_and_is_idempotent() {
+        let html = "<!doctype html><html><head><title>chat</title></head><body>ok</body></html>";
+        let once = inject_chat_html(html);
+        let head = once.split("</head>").next().unwrap();
+        assert!(head.contains(&inject_snippet(STUDIO_INJECT_JS_PATH)));
+        assert_eq!(inject_chat_html(&once), once, "second pass is a no-op");
+        assert_eq!(
+            inject_agui_markup(&once, "/other.js"),
+            once,
+            "marker wins over a different script src"
+        );
+        let bare = inject_agui_markup("<p>no head</p>", "/x.js");
+        assert!(bare.starts_with(&inject_snippet("/x.js")));
+    }
+
+    #[test]
+    fn inject_does_not_rewrite_urls_in_html() {
         let html = r#"<html><head></head><body>
 <script>new HttpAgent({ url: "https://chat.mcpwork.space/api/copilotkit" });</script>
-<script>fetch("/api/agent/game",{method:"POST",headers:{"content-type":"application/json"}});</script>
-<script>fetch("/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7?since=0",{headers:{accept:"text/event-stream"}});</script>
+<script>fetch("/api/agent/game",{method:"POST"});</script>
+<script>fetch("/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7?since=0");</script>
 <img src="https://chat.mcpwork.space/logo.png">
 </body></html>"#;
         let out = inject_chat_html(html);
-        assert!(out.contains(INJECT_MARKER));
-        assert!(
-            out.contains(r#"url: "https://chat.mcpwork.space/api/copilotkit""#),
-            "must not invent HttpAgent URL rewrites: {out}"
-        );
-        assert!(
-            out.contains(r#"/api/agent/game"#),
-            "relative POST /api/agent stays: {out}"
-        );
-        assert!(
-            out.contains(r#"/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7?since=0"#),
-            "relative GET /api/runs stays: {out}"
-        );
-        assert!(
-            !out.contains("/api/studio/ag-ui?to="),
-            "HTML must not rewrite quoted URLs: {out}"
+        assert_eq!(
+            out.replacen(&inject_snippet(STUDIO_INJECT_JS_PATH), "", 1),
+            html,
+            "the only change to Chat HTML is the script tag"
         );
     }
 
     #[test]
     fn run_sse_path_matches_live_chat_contract() {
-        assert!(is_chat_run_sse_path(
-            "/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7"
-        ));
-        assert!(is_chat_run_sse_path(
-            "/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7?since=0"
-        ));
+        assert!(is_chat_run_sse_path(RUN));
+        assert!(is_chat_run_sse_path(RUN_SINCE));
         assert!(!is_chat_run_sse_path("/api/runs"));
         assert!(!is_chat_run_sse_path("/api/runs/"));
-        assert!(!is_chat_run_sse_path(
-            "/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7/cancel"
-        ));
-        assert!(!is_chat_run_sse_path(
-            "/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7/scouts/abc"
-        ));
+        assert!(!is_chat_run_sse_path(&format!("{RUN}/cancel")));
+        assert!(!is_chat_run_sse_path(&format!("{RUN}/scouts/abc")));
         assert!(!is_chat_run_sse_path("/api/agent/game"));
         assert!(!is_chat_run_sse_path("/api/copilotkit"));
-        assert!(!is_chat_run_sse_path("/agent"));
         assert!(!is_chat_run_sse_path("/api/threads"));
     }
 
     #[test]
-    fn fetch_get_runs_sse_is_rewritten_post_agent_is_not() {
-        let run = "/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7?since=0";
+    fn fetch_rewrite_is_get_api_runs_uuid_only() {
+        assert!(inject_rewrites_fetch("GET", RUN_SINCE));
+        assert!(inject_rewrites_fetch("GET", RUN));
         assert!(
-            inject_rewrites_fetch("GET", run),
-            "production Chat: fetch GET /api/runs SSE (with ?since= preserved)"
+            inject_rewrites_fetch("get", RUN_SINCE),
+            "method comparison is case-insensitive"
         );
-        assert!(
-            inject_rewrites_fetch("GET", "/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7"),
-            "GET /api/runs/{{uuid}} is the run stream regardless of Accept"
-        );
-        assert!(
-            inject_rewrites_fetch("get", run),
-            "method comparison is case-insensitive like the JS toUpperCase()"
-        );
-        assert!(inject_rewrites_fetch(
-            "GET",
-            "https://chat.mcpwork.space/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7?since=0"
-        ));
+        assert!(inject_rewrites_fetch("GET", &format!("{CHAT}{RUN_SINCE}")));
         assert!(
             !inject_rewrites_fetch(
                 "GET",
                 "/api/threads/1de8f6f0-b0c5-4903-8a7b-15aaae852f62/runs"
             ),
-            "other Chat SSE stays on the SSO proxy: Accept: text/event-stream alone \
-             must not redirect it to the streamer, which only forwards /api/runs/{{uuid}}"
+            "other Chat SSE stays on the SSO proxy"
         );
         assert!(!inject_rewrites_fetch("GET", "/api/threads"));
         assert!(!inject_rewrites_fetch("POST", "/api/agent/game"));
-        assert!(!inject_rewrites_fetch(
-            "POST",
-            "/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7"
-        ));
-        assert!(!inject_rewrites_fetch(
-            "POST",
-            "/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7/cancel"
-        ));
-        assert!(!inject_rewrites_fetch(
-            "GET",
-            "/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7/cancel"
-        ));
+        assert!(!inject_rewrites_fetch("POST", RUN));
+        assert!(!inject_rewrites_fetch("POST", &format!("{RUN}/cancel")));
+        assert!(!inject_rewrites_fetch("GET", &format!("{RUN}/cancel")));
+        assert!(!inject_rewrites_fetch("GET", &format!("{RUN}/scouts/abc")));
+        assert!(
+            !inject_rewrites_fetch("GET", &format!("{STUDIO_AGUI_PATH}?to={RUN_SINCE}")),
+            "the streamer itself is never rewritten again"
+        );
         assert!(!inject_rewrites_fetch(
             "GET",
-            "/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7/scouts/abc"
-        ));
-        assert!(!inject_rewrites_fetch(
-            "GET",
-            "/api/studio/ag-ui?to=/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7?since=0"
-        ));
-        assert!(!inject_rewrites_fetch(
-            "GET",
-            "https://chat.mcpwork.space/api/studio/ag-ui?to=/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7"
+            &format!("{CHAT}{STUDIO_AGUI_PATH}?to={RUN}")
         ));
     }
 
     #[test]
     fn streamer_only_forwards_run_sse_on_chat_origin() {
-        let origin = "https://chat.mcpwork.space";
-        let run = "/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7?since=0";
-        assert_eq!(sanitize_agui_target(run, origin).as_deref(), Some(run));
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "x-studio-agui-url",
-            axum::http::HeaderValue::from_static(
-                "https://chat.mcpwork.space/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7?since=0",
-            ),
-        );
         assert_eq!(
-            agui_upstream_path(&headers, None, origin).as_deref(),
-            Some(run)
+            sanitize_agui_target(RUN_SINCE, CHAT).as_deref(),
+            Some(RUN_SINCE)
         );
-        headers.insert(
-            "x-studio-agui-url",
-            axum::http::HeaderValue::from_static("https://chat.mcpwork.space/api/copilotkit"),
-        );
-        assert!(
-            agui_upstream_path(&headers, None, origin).is_none(),
-            "must not forward invented CopilotKit path"
-        );
-        headers.insert(
-            "x-studio-agui-url",
-            axum::http::HeaderValue::from_static("https://chat.mcpwork.space/api/agent/game"),
-        );
-        assert!(
-            agui_upstream_path(&headers, None, origin).is_none(),
-            "POST /api/agent is JSON 202, not the SSE streamer"
-        );
-        assert!(agui_upstream_path(&HeaderMap::new(), Some("to=/agent"), origin).is_none());
+        assert!(sanitize_agui_target(STUDIO_AGUI_PATH, CHAT).is_none());
+        assert!(sanitize_agui_target("https://evil.example/x", CHAT).is_none());
+        assert!(sanitize_agui_target("/ok/../secret", CHAT).is_none());
+
         assert_eq!(
             agui_upstream_path(
-                &HeaderMap::new(),
-                Some("to=/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7?since=0"),
-                origin
+                &header("https://chat.mcpwork.space/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7?since=0"),
+                None,
+                CHAT
             )
             .as_deref(),
-            Some(run)
+            Some(RUN_SINCE)
         );
-        assert!(sanitize_agui_target(STUDIO_AGUI_PATH, origin).is_none());
-        assert!(sanitize_agui_target("https://evil.example/x", origin).is_none());
-        assert!(sanitize_agui_target("/ok/../secret", origin).is_none());
+        assert!(
+            agui_upstream_path(
+                &header("https://chat.mcpwork.space/api/copilotkit"),
+                None,
+                CHAT
+            )
+            .is_none(),
+            "must not forward an invented CopilotKit path"
+        );
+        assert!(
+            agui_upstream_path(
+                &header("https://chat.mcpwork.space/api/agent/game"),
+                None,
+                CHAT
+            )
+            .is_none(),
+            "POST /api/agent is JSON 202, not the SSE streamer"
+        );
+        assert!(agui_upstream_path(&HeaderMap::new(), Some("to=/agent"), CHAT).is_none());
         assert_eq!(
-            percent_decode(&percent_encode(
-                "/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7?since=0"
-            )),
-            "/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7?since=0"
+            agui_upstream_path(&HeaderMap::new(), Some(&format!("to={RUN_SINCE}")), CHAT)
+                .as_deref(),
+            Some(RUN_SINCE)
         );
     }
 }

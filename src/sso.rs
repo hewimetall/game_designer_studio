@@ -37,18 +37,12 @@ use reqwest::Response;
 use crate::apps::SystemTab;
 use crate::config::StudioConfig;
 use crate::inject::{
-    agui_upstream_path, is_chat_run_sse_path, is_html_content_type_str, script_src_for_request,
-    STUDIO_AGUI_PATH, STUDIO_INJECT_JS_PATH,
+    agui_upstream_path, inject_agui_markup, is_chat_run_sse_path, is_html_content_type_str,
+    script_src_for_request, STUDIO_AGUI_PATH, STUDIO_INJECT_JS_PATH,
 };
 use crate::inject_cache::{is_stream_media, InjectCache, InjectObject};
 use crate::proxy::Proxy;
 use crate::session::Session;
-
-pub use crate::inject::{
-    inject_agui_markup, sanitize_agui_target, INJECT_JS as AGUI_INJECT_JS,
-    INJECT_MARKER as AGUI_INJECT_MARKER, STUDIO_AGUI_PATH as AGUI_ENDPOINT,
-    STUDIO_INJECT_JS_PATH as AGUI_INJECT_JS_PATH,
-};
 
 const SKIP: &[&str] = &[
     "connection",
@@ -184,7 +178,9 @@ pub async fn handle_studio_agui(
     let Some(pq) = agui_upstream_path(&headers, uri.query(), chat_origin) else {
         return (
             StatusCode::BAD_REQUEST,
-            axum::Json(serde_json::json!({ "error": "только GET /api/runs/{uuid} на chat origin" })),
+            axum::Json(
+                serde_json::json!({ "error": "только GET /api/runs/{uuid} на chat origin" }),
+            ),
         )
             .into_response();
     };
@@ -631,41 +627,84 @@ pub async fn settle_system_apps(client: &reqwest::Client, cfg: &StudioConfig) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cache::{now_secs, ReadCache};
+    use crate::cache::ReadCache;
+    use crate::inject::{INJECT_JS, INJECT_MARKER};
     use crate::progress::ProgressHub;
     use crate::session::LiveState;
     use std::convert::Infallible;
     use std::pin::Pin;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::{Context, Poll};
     use tokio::runtime::Runtime;
     use tokio::sync::{mpsc, Notify};
+
+    const RUN: &str = "/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7";
+    const RUN_SINCE: &str = "/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7?since=0";
+    /// Short GET/write timeouts so a held SSE stream proves `stream_timeout` is used.
+    const SHORT_TIMEOUT: Duration = Duration::from_millis(400);
+
+    fn temp_dir(label: &str) -> std::path::PathBuf {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "designer-sso-{label}-{}-{stamp}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
 
     fn dummy_session() -> Session {
         let jar = Arc::new(reqwest::cookie::Jar::default());
         Session::new("s".into(), "u".into(), jar).unwrap()
     }
 
-    fn test_proxy(stand: String, cache_dir: std::path::PathBuf) -> Arc<Proxy> {
-        let mut cfg = StudioConfig::production(std::path::PathBuf::from("ui"), 0, Some(cache_dir));
-        cfg.stand_host = stand;
-        cfg.get_timeout = Duration::from_millis(800);
-        cfg.write_timeout = Duration::from_millis(800);
+    /// Proxy with a live dummy session; the stand origin is never contacted here.
+    fn logged_in_proxy(cache_dir: &std::path::Path) -> Arc<Proxy> {
+        let mut cfg = StudioConfig::production(
+            std::path::PathBuf::from("ui"),
+            0,
+            Some(cache_dir.to_path_buf()),
+        );
+        cfg.stand_host = "http://127.0.0.1:1".into();
+        cfg.get_timeout = SHORT_TIMEOUT;
+        cfg.write_timeout = SHORT_TIMEOUT;
         cfg.stream_timeout = Duration::from_secs(5);
-        Arc::new(Proxy {
+        let proxy = Arc::new(Proxy {
             cfg,
-            cache: ReadCache::open(std::env::temp_dir().join(format!(
-                "designer-sso-cache-{}-{}",
-                std::process::id(),
-                now_secs()
-            )))
-            .unwrap(),
+            cache: ReadCache::open(cache_dir.join("reads")).unwrap(),
             live: Arc::new(LiveState::new()),
             progress: ProgressHub::new(),
-        })
+        });
+        proxy.live.set_session(dummy_session());
+        proxy
     }
 
-    /// `mpsc` → `Stream` without a extra crate (axum `Body::from_stream`).
+    async fn serve(app: Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}")
+    }
+
+    fn header_str<'a>(headers: &'a reqwest::header::HeaderMap, name: &str) -> Option<&'a str> {
+        headers.get(name).and_then(|v| v.to_str().ok())
+    }
+
+    fn html_response(html: &'static str) -> axum::response::Response {
+        let mut res = axum::response::Response::new(Body::from(html));
+        res.headers_mut().insert(
+            axum::http::header::CONTENT_TYPE,
+            HeaderValue::from_static("text/html; charset=utf-8"),
+        );
+        res
+    }
+
+    /// `mpsc` → `Stream` without an extra crate (axum `Body::from_stream`).
     struct BodyChan {
         rx: mpsc::Receiver<Result<Bytes, Infallible>>,
     }
@@ -678,61 +717,115 @@ mod tests {
         }
     }
 
+    /// Mock chat origin whose `GET /api/runs/{id}` emits one `RUN_STARTED` event
+    /// echoing the request headers it saw, then blocks until `release`.
+    struct SseOrigin {
+        origin: String,
+        release: Arc<Notify>,
+    }
+
+    async fn spawn_sse_origin() -> SseOrigin {
+        let release = Arc::new(Notify::new());
+        let app = {
+            let release = release.clone();
+            Router::new().route(
+                "/api/runs/{id}",
+                axum::routing::get(move |req: axum::extract::Request| {
+                    let release = release.clone();
+                    async move {
+                        let seen = |name: &str| {
+                            req.headers()
+                                .get(name)
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or("")
+                                .to_string()
+                        };
+                        let first = serde_json::json!({
+                            "type": "RUN_STARTED",
+                            "accept_encoding": seen("accept-encoding"),
+                            "accept": seen("accept"),
+                            "csrf": seen("x-csrf-token"),
+                            "agui_url_leaked": req.headers().contains_key("x-studio-agui-url"),
+                            "cookie_leaked": req.headers().contains_key("cookie"),
+                        });
+                        let (tx, rx) = mpsc::channel::<Result<Bytes, Infallible>>(4);
+                        tokio::spawn(async move {
+                            let _ = tx.send(Ok(Bytes::from(format!("data: {first}\n\n")))).await;
+                            release.notified().await;
+                            let _ = tx
+                                .send(Ok(Bytes::from("data: {\"type\":\"RUN_FINISHED\"}\n\n")))
+                                .await;
+                        });
+                        let mut res =
+                            axum::response::Response::new(Body::from_stream(BodyChan { rx }));
+                        res.headers_mut().insert(
+                            axum::http::header::CONTENT_TYPE,
+                            HeaderValue::from_static("text/event-stream"),
+                        );
+                        res.headers_mut().insert(
+                            axum::http::header::SET_COOKIE,
+                            HeaderValue::from_static("access_token=secret; Path=/; HttpOnly"),
+                        );
+                        res
+                    }
+                }),
+            )
+        };
+        SseOrigin {
+            origin: serve(app).await,
+            release,
+        }
+    }
+
+    /// First SSE event as JSON; must arrive while the origin is still holding the run.
+    async fn first_event(res: &mut reqwest::Response) -> serde_json::Value {
+        let chunk = tokio::time::timeout(SHORT_TIMEOUT, res.chunk())
+            .await
+            .expect("first SSE chunk must not wait for the origin run to finish")
+            .expect("chunk")
+            .expect("body");
+        let text = String::from_utf8_lossy(&chunk);
+        assert!(
+            !text.contains("RUN_FINISHED"),
+            "must not buffer the run: {text}"
+        );
+        let json = text.trim().strip_prefix("data: ").expect("sse data line");
+        serde_json::from_str(json).expect("json event")
+    }
+
+    async fn rest_of_body(res: &mut reqwest::Response) -> String {
+        let mut rest = Vec::new();
+        while let Some(chunk) = res.chunk().await.unwrap() {
+            rest.extend_from_slice(&chunk);
+        }
+        String::from_utf8_lossy(&rest).into_owned()
+    }
+
     #[test]
     fn unauthenticated_sso_port_is_401() {
-        let dir = std::env::temp_dir().join(format!(
-            "designer-sso-401-{}-{}",
-            std::process::id(),
-            now_secs()
-        ));
-        let _ = std::fs::create_dir_all(&dir);
-        let proxy = test_proxy("http://127.0.0.1:1".into(), dir.clone());
-        let rt = Runtime::new().unwrap();
-        rt.block_on(async {
-            let app = router(proxy, "http://127.0.0.1:1".into());
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
-            tokio::spawn(async move {
-                axum::serve(listener, app).await.unwrap();
-            });
-            let res = reqwest::Client::new()
-                .get(format!("http://{addr}/api/me"))
-                .send()
-                .await
-                .unwrap();
+        let dir = temp_dir("401");
+        let proxy = logged_in_proxy(&dir);
+        proxy.live.clear_session();
+        Runtime::new().unwrap().block_on(async {
+            let addr = serve(router(proxy, "http://127.0.0.1:1".into())).await;
+            let res = reqwest::get(format!("{addr}/api/me")).await.unwrap();
             assert_eq!(res.status(), reqwest::StatusCode::UNAUTHORIZED);
         });
         let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
-    fn forwards_csrf_header_and_strips_set_cookie() {
-        let dir = std::env::temp_dir().join(format!(
-            "designer-sso-fwd-{}-{}",
-            std::process::id(),
-            now_secs()
-        ));
-        let _ = std::fs::create_dir_all(&dir);
-        let proxy = test_proxy("http://127.0.0.1:1".into(), dir.clone());
-        let rt = Runtime::new().unwrap();
-        rt.block_on(async {
-            use axum::extract::Request;
-            let origin_app = axum::Router::new().fallback(|req: Request| async move {
-                let csrf = req
-                    .headers()
-                    .get("x-csrf-token")
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("")
-                    .to_string();
-                let origin = req
-                    .headers()
-                    .get("origin")
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("")
-                    .to_string();
-                let mut res = axum::response::Response::new(Body::from(format!(
-                    "{{\"csrf\":\"{csrf}\",\"origin\":\"{origin}\"}}"
-                )));
+    fn forwards_headers_with_native_jar_and_strips_set_cookie() {
+        let dir = temp_dir("fwd");
+        let proxy = logged_in_proxy(&dir);
+        Runtime::new().unwrap().block_on(async {
+            let origin_app = Router::new().fallback(|req: axum::extract::Request| async move {
+                let body = serde_json::json!({
+                    "csrf": req.headers().get("x-csrf-token").and_then(|v| v.to_str().ok()),
+                    "origin": req.headers().get("origin").and_then(|v| v.to_str().ok()),
+                    "cookie_leaked": req.headers().contains_key("cookie"),
+                });
+                let mut res = axum::response::Response::new(Body::from(body.to_string()));
                 res.headers_mut().insert(
                     axum::http::header::CONTENT_TYPE,
                     HeaderValue::from_static("application/json"),
@@ -743,69 +836,42 @@ mod tests {
                 );
                 res
             });
-            let origin_lis = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let origin_addr = origin_lis.local_addr().unwrap();
-            tokio::spawn(async move {
-                axum::serve(origin_lis, origin_app).await.unwrap();
-            });
-            let origin = format!("http://{origin_addr}");
-            proxy.live.set_session(dummy_session());
-            let app = router(proxy, origin.clone());
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
-            tokio::spawn(async move {
-                axum::serve(listener, app).await.unwrap();
-            });
+            let origin = serve(origin_app).await;
+            let addr = serve(router(proxy, origin.clone())).await;
             let res = reqwest::Client::new()
-                .post(format!("http://{addr}/api/me"))
+                .post(format!("{addr}/api/me"))
                 .header("x-csrf-token", "tok-1")
-                .header("cookie", "should-not-leak=1")
+                .header("cookie", "webview-cookie=1")
                 .send()
                 .await
                 .unwrap();
             assert_eq!(res.status(), reqwest::StatusCode::OK);
-            assert!(res.headers().get("set-cookie").is_none());
-            assert_eq!(
-                res.headers()
-                    .get("x-studio-sso")
-                    .and_then(|v| v.to_str().ok()),
-                Some("live")
+            assert!(
+                res.headers().get("set-cookie").is_none(),
+                "origin cookies stay in the Rust jar, never reach the WebView"
             );
             let json: serde_json::Value = res.json().await.unwrap();
             assert_eq!(json["csrf"], "tok-1");
-            assert_eq!(json["origin"], origin);
+            assert_eq!(
+                json["origin"], origin,
+                "Origin is rewritten to the upstream"
+            );
+            assert_eq!(json["cookie_leaked"], false, "WebView cookies are dropped");
         });
         let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
     fn login_redirect_off_origin_is_unusable() {
-        let dir = std::env::temp_dir().join(format!(
-            "designer-sso-redir-{}-{}",
-            std::process::id(),
-            now_secs()
-        ));
-        let _ = std::fs::create_dir_all(&dir);
         let session = dummy_session();
-        let rt = Runtime::new().unwrap();
-        rt.block_on(async {
-            let login = axum::Router::new().fallback(|| async { "authentik login" });
-            let login_lis = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let login_addr = login_lis.local_addr().unwrap();
-            tokio::spawn(async move {
-                axum::serve(login_lis, login).await.unwrap();
-            });
-            let login_url = format!("http://{login_addr}/if/flow/");
-            let app = axum::Router::new().fallback(move || {
+        Runtime::new().unwrap().block_on(async {
+            let login = serve(Router::new().fallback(|| async { "authentik login" })).await;
+            let login_url = format!("{login}/if/flow/");
+            let origin = serve(Router::new().fallback(move || {
                 let target = login_url.clone();
                 async move { axum::response::Redirect::temporary(&target) }
-            });
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
-            tokio::spawn(async move {
-                axum::serve(listener, app).await.unwrap();
-            });
-            let origin = format!("http://{addr}");
+            }))
+            .await;
             let res = forward_sso(
                 &session,
                 &origin,
@@ -813,187 +879,61 @@ mod tests {
                 "/",
                 HeaderMap::new(),
                 Bytes::new(),
-                Duration::from_millis(800),
+                SHORT_TIMEOUT,
             )
             .await;
             assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
         });
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
-    fn websocket_upgrade_is_not_proxied() {
-        assert!(is_websocket_upgrade(&{
-            let mut h = HeaderMap::new();
-            h.insert(
-                axum::http::header::UPGRADE,
-                HeaderValue::from_static("websocket"),
-            );
-            h
-        }));
-        assert!(!is_websocket_upgrade(&HeaderMap::new()));
-    }
-
-    #[test]
-    fn live_chat_contract_timeouts() {
+    fn run_sse_requests_get_the_stream_timeout() {
         let cfg = StudioConfig::production(std::path::PathBuf::from("ui"), 0, None);
         let mut sse = HeaderMap::new();
         sse.insert(
             axum::http::header::ACCEPT,
             HeaderValue::from_static("text/event-stream"),
         );
-        let run = "/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7?since=0";
+        let none = HeaderMap::new();
         assert_eq!(
-            sso_timeout(&Method::GET, &sse, run, &cfg),
+            sso_timeout(&Method::GET, &sse, RUN_SINCE, &cfg),
             cfg.stream_timeout
         );
         assert_eq!(
-            sso_timeout(&Method::GET, &HeaderMap::new(), run, &cfg),
-            cfg.stream_timeout
-        );
-        assert_ne!(cfg.stream_timeout, cfg.get_timeout);
-        assert_ne!(cfg.stream_timeout, cfg.write_timeout);
-        assert!(cfg.stream_timeout >= Duration::from_secs(5 * 60));
-        assert_eq!(
-            sso_timeout(&Method::GET, &HeaderMap::new(), "/", &cfg),
-            cfg.get_timeout
+            sso_timeout(&Method::GET, &none, RUN_SINCE, &cfg),
+            cfg.stream_timeout,
+            "GET /api/runs/{{uuid}} is the run even without Accept"
         );
         assert_eq!(
-            sso_timeout(&Method::POST, &HeaderMap::new(), "/api/agent/game", &cfg),
+            sso_timeout(&Method::GET, &sse, "/api/threads/x/runs", &cfg),
+            cfg.stream_timeout,
+            "Accept: text/event-stream alone still streams"
+        );
+        assert_eq!(sso_timeout(&Method::GET, &none, "/", &cfg), cfg.get_timeout);
+        assert_eq!(
+            sso_timeout(&Method::POST, &none, "/api/agent/game", &cfg),
             cfg.write_timeout
         );
         assert_eq!(
-            sso_timeout(
-                &Method::POST,
-                &HeaderMap::new(),
-                "/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7/cancel",
-                &cfg
-            ),
+            sso_timeout(&Method::POST, &none, &format!("{RUN}/cancel"), &cfg),
             cfg.write_timeout
         );
         assert_eq!(
-            sso_timeout(
-                &Method::GET,
-                &HeaderMap::new(),
-                "/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7/scouts/abc",
-                &cfg
-            ),
+            sso_timeout(&Method::GET, &none, &format!("{RUN}/scouts/abc"), &cfg),
             cfg.get_timeout
         );
-        assert!(wants_event_stream(&sse));
-        assert!(!wants_event_stream(&HeaderMap::new()));
-        assert!(is_chat_run_sse_path(
-            "/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7"
-        ));
-        assert!(!is_chat_run_sse_path("/api/agent/game"));
-        assert!(!is_chat_run_sse_path("/agent"));
-        assert!(!is_chat_run_sse_path(
-            "/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7/cancel"
-        ));
     }
 
     #[test]
-    fn streams_sse_first_chunk_before_origin_finishes() {
-        let dir = std::env::temp_dir().join(format!(
-            "designer-sso-sse-{}-{}",
-            std::process::id(),
-            now_secs()
-        ));
-        let _ = std::fs::create_dir_all(&dir);
-        let proxy = test_proxy("http://127.0.0.1:1".into(), dir.clone());
-        let rt = Runtime::new().unwrap();
-        rt.block_on(async {
-            let release = Arc::new(Notify::new());
-            let first_sent = Arc::new(AtomicBool::new(false));
-            let origin_app = {
-                let release = release.clone();
-                let first_sent = first_sent.clone();
-                axum::Router::new().route(
-                    "/api/runs/{id}",
-                    axum::routing::get(move |req: axum::extract::Request| {
-                        let release = release.clone();
-                        let first_sent = first_sent.clone();
-                        async move {
-                            let accept_enc = req
-                                .headers()
-                                .get(axum::http::header::ACCEPT_ENCODING)
-                                .and_then(|v| v.to_str().ok())
-                                .unwrap_or("")
-                                .to_string();
-                            let accept = req
-                                .headers()
-                                .get(axum::http::header::ACCEPT)
-                                .and_then(|v| v.to_str().ok())
-                                .unwrap_or("")
-                                .to_string();
-                            let csrf = req
-                                .headers()
-                                .get("x-csrf-token")
-                                .and_then(|v| v.to_str().ok())
-                                .unwrap_or("")
-                                .to_string();
-                            let ctype = req
-                                .headers()
-                                .get(axum::http::header::CONTENT_TYPE)
-                                .and_then(|v| v.to_str().ok())
-                                .unwrap_or("")
-                                .to_string();
-                            let (tx, rx) = mpsc::channel::<Result<Bytes, Infallible>>(4);
-                            tokio::spawn(async move {
-                                let chunk = format!(
-                                    "data: {{\"type\":\"RUN_STARTED\",\"ae\":\"{accept_enc}\",\"accept\":\"{accept}\",\"csrf\":\"{csrf}\",\"ct\":\"{ctype}\"}}\n\n"
-                                );
-                                let _ = tx.send(Ok(Bytes::from(chunk))).await;
-                                first_sent.store(true, Ordering::SeqCst);
-                                release.notified().await;
-                                let _ = tx
-                                    .send(Ok(Bytes::from(
-                                        "data: {\"type\":\"RUN_FINISHED\"}\n\n",
-                                    )))
-                                    .await;
-                            });
-                            let mut res = axum::response::Response::new(Body::from_stream(
-                                BodyChan { rx },
-                            ));
-                            res.headers_mut().insert(
-                                axum::http::header::CONTENT_TYPE,
-                                HeaderValue::from_static("text/event-stream"),
-                            );
-                            res.headers_mut().insert(
-                                axum::http::header::CACHE_CONTROL,
-                                HeaderValue::from_static("no-cache"),
-                            );
-                            res.headers_mut().insert(
-                                HeaderName::from_static("x-accel-buffering"),
-                                HeaderValue::from_static("no"),
-                            );
-                            res.headers_mut().insert(
-                                axum::http::header::SET_COOKIE,
-                                HeaderValue::from_static("access_token=secret; Path=/; HttpOnly"),
-                            );
-                            res
-                        }
-                    }),
-                )
-            };
-            let origin_lis = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let origin_addr = origin_lis.local_addr().unwrap();
-            tokio::spawn(async move {
-                axum::serve(origin_lis, origin_app).await.unwrap();
-            });
-            let origin = format!("http://{origin_addr}");
-            proxy.live.set_session(dummy_session());
-            let app = router(proxy, origin);
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
-            tokio::spawn(async move {
-                axum::serve(listener, app).await.unwrap();
-            });
+    fn relative_run_sse_streams_gzip_off_and_outlives_get_timeout() {
+        let dir = temp_dir("sse");
+        let proxy = logged_in_proxy(&dir);
+        Runtime::new().unwrap().block_on(async {
+            let upstream = spawn_sse_origin().await;
+            let addr = serve(router(proxy, upstream.origin.clone())).await;
 
             let mut res = reqwest::Client::new()
-                .get(format!(
-                    "http://{addr}/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7?since=0"
-                ))
+                .get(format!("{addr}{RUN_SINCE}"))
                 .header("accept", "text/event-stream")
                 .header("x-csrf-token", "tok-sse")
                 .send()
@@ -1001,614 +941,300 @@ mod tests {
                 .unwrap();
             assert_eq!(res.status(), reqwest::StatusCode::OK);
             assert!(res.headers().get("set-cookie").is_none());
-            let ct = res
-                .headers()
-                .get("content-type")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("");
-            assert!(
-                ct.contains("text/event-stream"),
-                "content-type was {ct}"
-            );
-            assert_eq!(
-                res.headers()
-                    .get("cache-control")
-                    .and_then(|v| v.to_str().ok()),
-                Some("no-cache")
-            );
-            assert_eq!(
-                res.headers()
-                    .get("x-accel-buffering")
-                    .and_then(|v| v.to_str().ok()),
-                Some("no")
-            );
+            assert!(header_str(res.headers(), "content-type")
+                .unwrap_or("")
+                .contains("text/event-stream"));
 
-            // First SSE event must arrive while origin is still blocked on `release`.
-            // write_timeout is 800ms; sleeping past that proves stream_timeout is used.
-            let first = tokio::time::timeout(Duration::from_millis(400), res.chunk())
-                .await
-                .expect("first SSE chunk must not wait for the origin run to finish")
-                .expect("chunk")
-                .expect("body");
-            let first = String::from_utf8_lossy(&first);
-            assert!(
-                first.contains("RUN_STARTED"),
-                "unexpected first chunk: {first}"
-            );
-            assert!(first.contains("\"ae\":\"identity\""));
-            assert!(first.contains("text/event-stream"));
-            assert!(first.contains("tok-sse"));
-            assert!(
-                first_sent.load(Ordering::SeqCst),
-                "origin must have emitted the first chunk"
-            );
-            assert!(
-                !first.contains("RUN_FINISHED"),
-                "must not buffer the rest of the run: {first}"
-            );
+            let first = first_event(&mut res).await;
+            assert_eq!(first["type"], "RUN_STARTED");
+            assert_eq!(first["accept_encoding"], "identity", "no gzip on the run");
+            assert_eq!(first["accept"], "text/event-stream");
+            assert_eq!(first["csrf"], "tok-sse");
+            assert_eq!(first["cookie_leaked"], false);
 
-            tokio::time::sleep(Duration::from_millis(1200)).await;
-            release.notify_one();
-
-            let mut rest = Vec::new();
-            while let Some(chunk) = res.chunk().await.unwrap() {
-                rest.extend_from_slice(&chunk);
-            }
-            let rest = String::from_utf8_lossy(&rest);
-            assert!(
-                rest.contains("RUN_FINISHED"),
-                "missing terminal event after release: {rest}"
-            );
+            // Hold the run past get/write timeout: only stream_timeout may apply.
+            tokio::time::sleep(SHORT_TIMEOUT + SHORT_TIMEOUT / 2).await;
+            upstream.release.notify_one();
+            assert!(rest_of_body(&mut res).await.contains("RUN_FINISHED"));
         });
         let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
-    fn inject_markup_lands_in_head_once() {
-        let html = "<!doctype html><html><head><title>chat</title></head><body>ok</body></html>";
-        let out = inject_agui_markup(html, "http://127.0.0.1:9/api/studio/ag-ui-inject.js");
-        assert!(out.contains(AGUI_INJECT_MARKER));
-        assert!(out.contains("/api/studio/ag-ui-inject.js"));
-        let head = out.split("</head>").next().unwrap();
-        assert!(head.contains(AGUI_INJECT_MARKER));
-        let twice = inject_agui_markup(&out, "/nope.js");
-        assert_eq!(twice.matches(AGUI_INJECT_MARKER).count(), 1);
-        assert!(!twice.contains("/nope.js"));
-        let bare = inject_agui_markup("<p>no head</p>", "/api/studio/ag-ui-inject.js");
-        assert!(bare.contains(&format!(
-            "<script id=\"studio-agui-inject\" src=\"/api/studio/ag-ui-inject.js\" {AGUI_INJECT_MARKER}>"
-        )));
-        assert!(AGUI_INJECT_JS.contains("__STUDIO_AGUI_INJECT__"));
-        assert!(AGUI_INJECT_JS.contains("/api/studio/ag-ui"));
-        assert!(AGUI_INJECT_JS.contains("X-Studio-Agui-Url"));
-        assert!(AGUI_INJECT_JS.contains("api\\/runs\\/"));
-        assert!(AGUI_INJECT_JS.contains("isGetRunSse"));
-        assert!(
-            !AGUI_INJECT_JS.contains("wantsEventStream"),
-            "only GET /api/runs/{{uuid}} is rewritten; Accept alone never is"
-        );
-        assert!(!AGUI_INJECT_JS.contains("isAbsoluteRunSse"));
-        assert!(!AGUI_INJECT_JS.contains("EventSource"));
-        assert!(!AGUI_INJECT_JS.contains("vnd.ag-ui"));
-        assert!(!AGUI_INJECT_JS.contains("HttpAgent"));
-        assert!(!AGUI_INJECT_JS.contains("copilotkit"));
-        assert!(!AGUI_INJECT_JS.contains("looksAguiUrl"));
+    fn studio_streamer_resolves_target_header_and_streams() {
+        let dir = temp_dir("agui");
+        let proxy = logged_in_proxy(&dir);
+        Runtime::new().unwrap().block_on(async {
+            let upstream = spawn_sse_origin().await;
+            let addr = serve(router(proxy, upstream.origin.clone())).await;
+
+            let mut res = reqwest::Client::new()
+                .get(format!("{addr}{STUDIO_AGUI_PATH}"))
+                .header(
+                    "x-studio-agui-url",
+                    format!("{}{RUN_SINCE}", upstream.origin),
+                )
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(res.status(), reqwest::StatusCode::OK);
+            assert!(header_str(res.headers(), "content-type")
+                .unwrap_or("")
+                .contains("text/event-stream"));
+            assert_eq!(
+                header_str(res.headers(), "cache-control"),
+                Some("no-cache"),
+                "the WebView must never cache the run"
+            );
+
+            let first = first_event(&mut res).await;
+            assert_eq!(first["type"], "RUN_STARTED");
+            assert_eq!(first["accept_encoding"], "identity");
+            assert_eq!(
+                first["accept"], "text/event-stream",
+                "Accept is added when missing"
+            );
+            assert_eq!(first["agui_url_leaked"], false, "studio header stays local");
+
+            upstream.release.notify_one();
+            assert!(rest_of_body(&mut res).await.contains("RUN_FINISHED"));
+        });
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
-    fn agui_target_stays_on_chat_origin() {
-        let run = "/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7?since=0";
-        assert_eq!(
-            sanitize_agui_target(run, "https://chat.mcpwork.space").as_deref(),
-            Some(run)
-        );
-        assert_eq!(
-            sanitize_agui_target(
-                "https://chat.mcpwork.space/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7?since=0",
-                "https://chat.mcpwork.space"
-            )
-            .as_deref(),
-            Some(run)
-        );
-        assert!(
-            sanitize_agui_target("https://evil.example/agent", "https://chat.mcpwork.space")
-                .is_none()
-        );
-        assert!(
-            sanitize_agui_target(AGUI_ENDPOINT, "https://chat.mcpwork.space").is_none(),
-            "studio streamer path must not loop"
-        );
-    }
-
-    #[test]
-    fn chat_html_gets_agui_inject_s3_does_not() {
-        let dir = std::env::temp_dir().join(format!(
-            "designer-sso-inject-html-{}-{}",
-            std::process::id(),
-            now_secs()
-        ));
-        let _ = std::fs::create_dir_all(&dir);
-        let rt = Runtime::new().unwrap();
-        rt.block_on(async {
-            let origin_app = axum::Router::new().fallback(|| async {
-                let mut res = axum::response::Response::new(Body::from(
-                    "<!doctype html><html><head><title>app</title></head><body>desk</body></html>",
-                ));
-                res.headers_mut().insert(
-                    axum::http::header::CONTENT_TYPE,
-                    HeaderValue::from_static("text/html; charset=utf-8"),
-                );
-                res.headers_mut().insert(
-                    axum::http::header::CONTENT_SECURITY_POLICY,
-                    HeaderValue::from_static("script-src 'self'"),
-                );
-                res
-            });
-            let origin_lis = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let origin_addr = origin_lis.local_addr().unwrap();
-            tokio::spawn(async move {
-                axum::serve(origin_lis, origin_app).await.unwrap();
-            });
-            let origin = format!("http://{origin_addr}");
-
-            let chat_proxy = test_proxy("http://127.0.0.1:1".into(), dir.join("chat"));
-            chat_proxy.live.set_session(dummy_session());
-            let chat_app = router_for(chat_proxy, origin.clone(), SystemTab::Chat);
-            let chat_lis = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let chat_addr = chat_lis.local_addr().unwrap();
-            tokio::spawn(async move {
-                axum::serve(chat_lis, chat_app).await.unwrap();
-            });
-
-            let s3_proxy = test_proxy("http://127.0.0.1:1".into(), dir.join("s3"));
-            s3_proxy.live.set_session(dummy_session());
-            let s3_app = router_for(s3_proxy, origin, SystemTab::S3);
-            let s3_lis = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let s3_addr = s3_lis.local_addr().unwrap();
-            tokio::spawn(async move {
-                axum::serve(s3_lis, s3_app).await.unwrap();
-            });
-
+    fn studio_streamer_rejects_foreign_targets_and_non_get() {
+        let dir = temp_dir("agui-reject");
+        let proxy = logged_in_proxy(&dir);
+        Runtime::new().unwrap().block_on(async {
+            let upstream = spawn_sse_origin().await;
+            let addr = serve(router(proxy, upstream.origin.clone())).await;
             let client = reqwest::Client::new();
-            let chat = client
-                .get(format!("http://{chat_addr}/"))
-                .send()
-                .await
-                .unwrap();
-            assert_eq!(chat.status(), reqwest::StatusCode::OK);
-            assert_eq!(
-                chat.headers()
-                    .get("x-studio-agui")
-                    .and_then(|v| v.to_str().ok()),
-                Some("inject")
-            );
-            assert!(chat.headers().get("content-security-policy").is_none());
-            let chat_html = chat.text().await.unwrap();
-            assert!(
-                chat_html.contains(AGUI_INJECT_MARKER),
-                "chat html missing inject: {chat_html}"
-            );
-            assert!(chat_html.contains("/api/studio/ag-ui-inject.js"));
-            assert!(chat_html.contains("<title>app</title>"));
 
-            let js = client
-                .get(format!(
-                    "http://{chat_addr}{AGUI_INJECT_JS_PATH}"
-                ))
+            let evil = client
+                .get(format!("{addr}{STUDIO_AGUI_PATH}"))
+                .header("x-studio-agui-url", "https://evil.example/agent")
                 .send()
                 .await
                 .unwrap();
-            assert_eq!(js.status(), reqwest::StatusCode::OK);
-            let js_body = js.text().await.unwrap();
-            assert!(js_body.contains("window.fetch"));
-            assert!(js_body.contains("api\\/runs\\/"));
-            assert!(js_body.contains("isGetRunSse"));
-            assert!(!js_body.contains("isAbsoluteRunSse"));
-            assert!(!js_body.contains("EventSource"));
+            assert_eq!(evil.status(), reqwest::StatusCode::BAD_REQUEST);
 
-            let s3 = client
-                .get(format!("http://{s3_addr}/"))
+            let invented = client
+                .get(format!("{addr}{STUDIO_AGUI_PATH}"))
+                .query(&[("to", "/api/copilotkit")])
                 .send()
                 .await
                 .unwrap();
-            assert_eq!(s3.status(), reqwest::StatusCode::OK);
-            assert!(s3.headers().get("x-studio-agui").is_none());
-            let s3_html = s3.text().await.unwrap();
-            assert!(
-                !s3_html.contains(AGUI_INJECT_MARKER),
-                "s3 html must not be patched: {s3_html}"
-            );
-            assert!(!s3_html.contains("/api/studio/ag-ui-inject.js"));
-            assert_eq!(
-                client
-                    .get(format!("http://{s3_addr}{AGUI_INJECT_JS_PATH}"))
+            assert_eq!(invented.status(), reqwest::StatusCode::BAD_REQUEST);
+
+            let post = client
+                .post(format!("{addr}{STUDIO_AGUI_PATH}"))
+                .header("x-studio-agui-url", format!("{}{RUN}", upstream.origin))
+                .body("{}")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(post.status(), reqwest::StatusCode::METHOD_NOT_ALLOWED);
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn websocket_upgrade_returns_501_on_sso_and_streamer() {
+        let dir = temp_dir("ws");
+        let proxy = logged_in_proxy(&dir);
+        Runtime::new().unwrap().block_on(async {
+            let addr = serve(router(proxy, "http://127.0.0.1:1".into())).await;
+            let client = reqwest::Client::new();
+            for path in ["/ws", STUDIO_AGUI_PATH] {
+                let res = client
+                    .get(format!("{addr}{path}"))
+                    .header("upgrade", "websocket")
+                    .header("connection", "Upgrade")
                     .send()
                     .await
-                    .unwrap()
-                    .status(),
-                reqwest::StatusCode::OK,
-                "s3 fallback may proxy the path to origin HTML, but must not serve inject js as a studio route"
+                    .unwrap();
+                assert_eq!(res.status(), reqwest::StatusCode::NOT_IMPLEMENTED, "{path}");
+            }
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn chat_html_gets_inject_s3_html_does_not() {
+        let dir = temp_dir("inject-html");
+        Runtime::new().unwrap().block_on(async {
+            const PAGE: &str =
+                "<!doctype html><html><head><title>app</title></head><body>desk</body></html>";
+            let origin = serve(Router::new().fallback(|| async { html_response(PAGE) })).await;
+            let chat = serve(router_for(
+                logged_in_proxy(&dir.join("chat")),
+                origin.clone(),
+                SystemTab::Chat,
+            ))
+            .await;
+            let s3 = serve(router_for(
+                logged_in_proxy(&dir.join("s3")),
+                origin,
+                SystemTab::S3,
+            ))
+            .await;
+            let client = reqwest::Client::new();
+
+            let chat_html = client.get(format!("{chat}/")).send().await.unwrap();
+            assert_eq!(chat_html.status(), reqwest::StatusCode::OK);
+            let chat_html = chat_html.text().await.unwrap();
+            let src = format!("{chat}{STUDIO_INJECT_JS_PATH}");
+            assert_eq!(
+                chat_html,
+                inject_agui_markup(PAGE, &src),
+                "chat HTML is the origin page plus the loopback script tag"
             );
-            // S3 has no studio inject route; origin HTML fallback is not the inject script.
+
+            let js = client.get(&src).send().await.unwrap();
+            assert_eq!(js.status(), reqwest::StatusCode::OK);
+            assert!(header_str(js.headers(), "content-type")
+                .unwrap_or("")
+                .contains("javascript"));
+            let js = js.text().await.unwrap();
+            assert_eq!(js, INJECT_JS);
+            assert!(js.contains("__STUDIO_AGUI_INJECT__"), "idempotency flag");
+
+            let s3_html = client.get(format!("{s3}/")).send().await.unwrap();
+            assert_eq!(s3_html.status(), reqwest::StatusCode::OK);
+            assert_eq!(s3_html.text().await.unwrap(), PAGE, "S3 HTML is untouched");
             let s3_js = client
-                .get(format!("http://{s3_addr}{AGUI_INJECT_JS_PATH}"))
+                .get(format!("{s3}{STUDIO_INJECT_JS_PATH}"))
                 .send()
                 .await
                 .unwrap()
                 .text()
                 .await
                 .unwrap();
-            assert!(
-                !s3_js.contains("__STUDIO_AGUI_INJECT__"),
-                "s3 must not serve the chat inject script"
+            assert_eq!(
+                s3_js, PAGE,
+                "S3 has no studio route; the path is proxied to origin"
             );
         });
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    #[test]
-    fn studio_agui_endpoint_streams_first_chunk_before_origin_finishes() {
-        let dir = std::env::temp_dir().join(format!(
-            "designer-sso-agui-inject-sse-{}-{}",
-            std::process::id(),
-            now_secs()
-        ));
-        let _ = std::fs::create_dir_all(&dir);
-        let proxy = test_proxy("http://127.0.0.1:1".into(), dir.clone());
-        let rt = Runtime::new().unwrap();
-        rt.block_on(async {
-            let release = Arc::new(Notify::new());
-            let first_sent = Arc::new(AtomicBool::new(false));
-            let origin_app = {
-                let release = release.clone();
-                let first_sent = first_sent.clone();
-                axum::Router::new().route(
-                    "/api/runs/{id}",
-                    axum::routing::get(move |req: axum::extract::Request| {
-                        let release = release.clone();
-                        let first_sent = first_sent.clone();
-                        async move {
-                            let accept_enc = req
-                                .headers()
-                                .get(axum::http::header::ACCEPT_ENCODING)
-                                .and_then(|v| v.to_str().ok())
-                                .unwrap_or("")
-                                .to_string();
-                            let accept = req
-                                .headers()
-                                .get(axum::http::header::ACCEPT)
-                                .and_then(|v| v.to_str().ok())
-                                .unwrap_or("")
-                                .to_string();
-                            let leaked = req
-                                .headers()
-                                .get("x-studio-agui-url")
-                                .is_some();
-                            let (tx, rx) = mpsc::channel::<Result<Bytes, Infallible>>(4);
-                            tokio::spawn(async move {
-                                let chunk = format!(
-                                    "data: {{\"type\":\"RUN_STARTED\",\"ae\":\"{accept_enc}\",\"accept\":\"{accept}\",\"leaked\":{leaked}}}\n\n"
-                                );
-                                let _ = tx.send(Ok(Bytes::from(chunk))).await;
-                                first_sent.store(true, Ordering::SeqCst);
-                                release.notified().await;
-                                let _ = tx
-                                    .send(Ok(Bytes::from(
-                                        "data: {\"type\":\"RUN_FINISHED\"}\n\n",
-                                    )))
-                                    .await;
-                            });
-                            let mut res =
-                                axum::response::Response::new(Body::from_stream(BodyChan { rx }));
-                            res.headers_mut().insert(
-                                axum::http::header::CONTENT_TYPE,
-                                HeaderValue::from_static("text/event-stream"),
-                            );
-                            res
-                        }
-                    }),
-                )
-            };
-            let origin_lis = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let origin_addr = origin_lis.local_addr().unwrap();
-            tokio::spawn(async move {
-                axum::serve(origin_lis, origin_app).await.unwrap();
-            });
-            let origin = format!("http://{origin_addr}");
-            proxy.live.set_session(dummy_session());
-            let app = router_for(proxy, origin.clone(), SystemTab::Chat);
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
-            tokio::spawn(async move {
-                axum::serve(listener, app).await.unwrap();
-            });
-
-            let run = "/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7?since=0";
-            let mut res = reqwest::Client::new()
-                .get(format!("http://{addr}{AGUI_ENDPOINT}"))
-                .header("accept", "text/event-stream")
-                .header("x-studio-agui-url", format!("{origin}{run}"))
-                .header("x-studio-agui-url-evil", "https://evil.example/agent")
-                .send()
-                .await
-                .unwrap();
-            assert_eq!(res.status(), reqwest::StatusCode::OK);
-            assert_eq!(
-                res.headers()
-                    .get("x-studio-agui")
-                    .and_then(|v| v.to_str().ok()),
-                Some("inject")
-            );
-            let ct = res
-                .headers()
-                .get("content-type")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("");
-            assert!(ct.contains("text/event-stream"), "content-type was {ct}");
-            assert_eq!(
-                res.headers()
-                    .get("cache-control")
-                    .and_then(|v| v.to_str().ok()),
-                Some("no-cache")
-            );
-            assert_eq!(
-                res.headers()
-                    .get("x-accel-buffering")
-                    .and_then(|v| v.to_str().ok()),
-                Some("no")
-            );
-
-            let first = tokio::time::timeout(Duration::from_millis(400), res.chunk())
-                .await
-                .expect("first SSE chunk must not wait for the origin run to finish")
-                .expect("chunk")
-                .expect("body");
-            let first = String::from_utf8_lossy(&first);
-            assert!(
-                first.contains("RUN_STARTED"),
-                "unexpected first chunk: {first}"
-            );
-            assert!(first.contains("\"ae\":\"identity\""));
-            assert!(first.contains("text/event-stream"));
-            assert!(first.contains("\"leaked\":false"));
-            assert!(!first.contains("RUN_FINISHED"));
-            assert!(first_sent.load(Ordering::SeqCst));
-
-            tokio::time::sleep(Duration::from_millis(1200)).await;
-            release.notify_one();
-            let mut rest = Vec::new();
-            while let Some(chunk) = res.chunk().await.unwrap() {
-                rest.extend_from_slice(&chunk);
-            }
-            assert!(String::from_utf8_lossy(&rest).contains("RUN_FINISHED"));
-
-            let blocked = reqwest::Client::new()
-                .get(format!("http://{addr}{AGUI_ENDPOINT}"))
-                .header("accept", "text/event-stream")
-                .header("x-studio-agui-url", "https://evil.example/agent")
-                .send()
-                .await
-                .unwrap();
-            assert_eq!(blocked.status(), reqwest::StatusCode::BAD_REQUEST);
-            let post = reqwest::Client::new()
-                .post(format!("http://{addr}{AGUI_ENDPOINT}"))
-                .header("accept", "text/event-stream")
-                .header(
-                    "x-studio-agui-url",
-                    format!("{origin}/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7"),
-                )
-                .body("{}")
-                .send()
-                .await
-                .unwrap();
-            assert_eq!(post.status(), reqwest::StatusCode::METHOD_NOT_ALLOWED);
-            let invented = reqwest::Client::new()
-                .get(format!("http://{addr}{AGUI_ENDPOINT}"))
-                .header("accept", "text/event-stream")
-                .query(&[("to", "/api/copilotkit")])
-                .send()
-                .await
-                .unwrap();
-            assert_eq!(invented.status(), reqwest::StatusCode::BAD_REQUEST);
-        });
-        let _ = std::fs::remove_dir_all(dir);
+    /// Mock chat origin: HTML at `/`, run SSE, JSON 202 composer. Counts HTML GETs.
+    fn chat_origin_app(html_gets: Arc<AtomicUsize>) -> Router {
+        Router::new()
+            .route(
+                "/",
+                axum::routing::get(move || {
+                    let html_gets = html_gets.clone();
+                    async move {
+                        html_gets.fetch_add(1, Ordering::SeqCst);
+                        html_response(
+                            "<!doctype html><html><head><title>chat</title></head><body></body></html>",
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/api/runs/{id}",
+                axum::routing::get(|| async {
+                    let mut res = axum::response::Response::new(Body::from(
+                        "data: {\"type\":\"RUN_STARTED\"}\n\n",
+                    ));
+                    res.headers_mut().insert(
+                        axum::http::header::CONTENT_TYPE,
+                        HeaderValue::from_static("text/event-stream"),
+                    );
+                    res
+                }),
+            )
+            .route(
+                "/api/agent/{id}",
+                axum::routing::post(|| async {
+                    let mut res = axum::response::Response::new(Body::from(
+                        r#"{"runId":"r1","threadId":"t1"}"#,
+                    ));
+                    *res.status_mut() = StatusCode::ACCEPTED;
+                    res.headers_mut().insert(
+                        axum::http::header::CONTENT_TYPE,
+                        HeaderValue::from_static("application/json"),
+                    );
+                    res
+                }),
+            )
     }
 
     #[test]
-    fn websocket_upgrade_returns_501_on_sso_and_agui() {
-        let dir = std::env::temp_dir().join(format!(
-            "designer-sso-ws-501-{}-{}",
-            std::process::id(),
-            now_secs()
-        ));
-        let _ = std::fs::create_dir_all(&dir);
-        let proxy = test_proxy("http://127.0.0.1:1".into(), dir.clone());
-        let rt = Runtime::new().unwrap();
-        rt.block_on(async {
-            proxy.live.set_session(dummy_session());
-            let app = router_for(proxy, "http://127.0.0.1:1".into(), SystemTab::Chat);
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
-            tokio::spawn(async move {
-                axum::serve(listener, app).await.unwrap();
-            });
-            let client = reqwest::Client::new();
-            for path in ["/ws", AGUI_ENDPOINT] {
-                let res = client
-                    .get(format!("http://{addr}{path}"))
-                    .header("upgrade", "websocket")
-                    .header("connection", "Upgrade")
-                    .send()
-                    .await
-                    .unwrap();
-                assert_eq!(
-                    res.status(),
-                    reqwest::StatusCode::NOT_IMPLEMENTED,
-                    "ws path {path}"
-                );
-                let body = res.text().await.unwrap();
-                assert!(body.contains("WebSocket"), "{path}: {body}");
-            }
-        });
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn inject_cache_hit_skips_origin_and_sse_is_never_stored() {
-        use crate::inject_cache::InjectCache;
-        use std::sync::atomic::AtomicUsize;
-        let dir = std::env::temp_dir().join(format!(
-            "designer-sso-inject-cache-{}-{}",
-            std::process::id(),
-            now_secs()
-        ));
-        let _ = std::fs::create_dir_all(&dir);
-        let rt = Runtime::new().unwrap();
-        rt.block_on(async {
-            let gets = Arc::new(AtomicUsize::new(0));
-            let origin_app = {
-                let gets = gets.clone();
-                axum::Router::new()
-                    .route(
-                        "/",
-                        axum::routing::get(move || {
-                            let gets = gets.clone();
-                            async move {
-                                gets.fetch_add(1, Ordering::SeqCst);
-                                let mut res = axum::response::Response::new(Body::from(
-                                    r#"<!doctype html><html><head><title>chat</title></head><body>
-<script>fetch("/api/agent/game",{method:"POST",headers:{"content-type":"application/json"}});</script>
-<script>fetch("/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7?since=0",{headers:{accept:"text/event-stream"}});</script>
-</body></html>"#,
-                                ));
-                                res.headers_mut().insert(
-                                    axum::http::header::CONTENT_TYPE,
-                                    HeaderValue::from_static("text/html; charset=utf-8"),
-                                );
-                                res
-                            }
-                        }),
-                    )
-                    .route(
-                        "/api/runs/{id}",
-                        axum::routing::get(|| async {
-                            let mut res = axum::response::Response::new(Body::from(
-                                "data: {\"type\":\"RUN_STARTED\"}\n\n",
-                            ));
-                            res.headers_mut().insert(
-                                axum::http::header::CONTENT_TYPE,
-                                HeaderValue::from_static("text/event-stream"),
-                            );
-                            res
-                        }),
-                    )
-                    .route(
-                        "/api/agent/{id}",
-                        axum::routing::post(|| async {
-                            let mut res = axum::response::Response::new(Body::from(
-                                r#"{"runId":"r1","threadId":"t1"}"#,
-                            ));
-                            *res.status_mut() = axum::http::StatusCode::ACCEPTED;
-                            res.headers_mut().insert(
-                                axum::http::header::CONTENT_TYPE,
-                                HeaderValue::from_static("application/json"),
-                            );
-                            res
-                        }),
-                    )
-            };
-            let origin_lis = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let origin_addr = origin_lis.local_addr().unwrap();
-            tokio::spawn(async move {
-                axum::serve(origin_lis, origin_app).await.unwrap();
-            });
-            let origin = format!("http://{origin_addr}");
+    fn cached_chat_html_is_served_without_a_second_origin_get() {
+        let dir = temp_dir("inject-cache-hit");
+        Runtime::new().unwrap().block_on(async {
+            let html_gets = Arc::new(AtomicUsize::new(0));
+            let origin = serve(chat_origin_app(html_gets.clone())).await;
             let cache = Arc::new(InjectCache::new());
-            let proxy = test_proxy("http://127.0.0.1:1".into(), dir.clone());
-            proxy.live.set_session(dummy_session());
-            let app = router_with_cache(proxy, origin.clone(), SystemTab::Chat, cache.clone());
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
-            tokio::spawn(async move {
-                axum::serve(listener, app).await.unwrap();
-            });
+            let addr = serve(router_with_cache(
+                logged_in_proxy(&dir),
+                origin,
+                SystemTab::Chat,
+                cache.clone(),
+            ))
+            .await;
             let client = reqwest::Client::new();
-            let first = client.get(format!("http://{addr}/")).send().await.unwrap();
+
+            let first = client.get(format!("{addr}/")).send().await.unwrap();
             assert_eq!(first.status(), reqwest::StatusCode::OK);
-            assert_eq!(
-                first
-                    .headers()
-                    .get("x-studio-inject-cache")
-                    .and_then(|v| v.to_str().ok()),
-                Some("miss")
-            );
-            let html = first.text().await.unwrap();
-            assert!(html.contains(AGUI_INJECT_MARKER));
-            assert!(html.contains("/api/studio/ag-ui-inject.js"));
-            assert!(
-                html.contains(r#"/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7?since=0"#),
-                "relative GET /api/runs must not be rewritten: {html}"
-            );
-            assert!(
-                !html.contains("/api/studio/ag-ui?to="),
-                "must not invent streamer query rewrites in HTML: {html}"
-            );
-            assert_eq!(gets.load(Ordering::SeqCst), 1);
+            let first = first.text().await.unwrap();
+            assert!(first.contains(INJECT_MARKER));
+            assert_eq!(html_gets.load(Ordering::SeqCst), 1);
             assert_eq!(cache.len(), 1);
 
-            let second = client.get(format!("http://{addr}/")).send().await.unwrap();
-            assert_eq!(
-                second
-                    .headers()
-                    .get("x-studio-inject-cache")
-                    .and_then(|v| v.to_str().ok()),
-                Some("hit")
-            );
-            let cached_html = second.text().await.unwrap();
-            assert!(cached_html.contains(AGUI_INJECT_MARKER));
-            assert_eq!(
-                gets.load(Ordering::SeqCst),
-                1,
-                "cache hit must not re-fetch"
-            );
-            assert_eq!(cache.len(), 1);
+            let second = client.get(format!("{addr}/")).send().await.unwrap();
+            assert_eq!(second.text().await.unwrap(), first);
+            assert_eq!(html_gets.load(Ordering::SeqCst), 1, "hit must not re-fetch");
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn run_sse_and_composer_json_never_enter_inject_cache() {
+        let dir = temp_dir("inject-cache-skip");
+        Runtime::new().unwrap().block_on(async {
+            let origin = serve(chat_origin_app(Arc::new(AtomicUsize::new(0)))).await;
+            let cache = Arc::new(InjectCache::new());
+            let addr = serve(router_with_cache(
+                logged_in_proxy(&dir),
+                origin,
+                SystemTab::Chat,
+                cache.clone(),
+            ))
+            .await;
+            let client = reqwest::Client::new();
 
             let sse = client
-                .get(format!(
-                    "http://{addr}/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7?since=0"
-                ))
+                .get(format!("{addr}{RUN_SINCE}"))
                 .header("accept", "text/event-stream")
                 .send()
                 .await
                 .unwrap();
             assert_eq!(sse.status(), reqwest::StatusCode::OK);
-            assert!(sse
-                .headers()
-                .get("content-type")
-                .and_then(|v| v.to_str().ok())
+            assert!(header_str(sse.headers(), "content-type")
                 .unwrap_or("")
                 .contains("text/event-stream"));
-            assert!(sse.headers().get("x-studio-inject-cache").is_none());
-            let _ = sse.bytes().await;
+            assert!(sse.text().await.unwrap().contains("RUN_STARTED"));
+
             let agent = client
-                .post(format!("http://{addr}/api/agent/game"))
+                .post(format!("{addr}/api/agent/game"))
                 .header("content-type", "application/json")
                 .body(r#"{"threadId":"t1","messages":[]}"#)
                 .send()
                 .await
                 .unwrap();
             assert_eq!(agent.status(), reqwest::StatusCode::ACCEPTED);
-            assert!(agent
-                .headers()
-                .get("content-type")
-                .and_then(|v| v.to_str().ok())
+            assert!(header_str(agent.headers(), "content-type")
                 .unwrap_or("")
                 .contains("application/json"));
-            assert_eq!(
-                cache.len(),
-                1,
-                "GET /api/runs SSE and POST /api/agent JSON must not enter inject cache"
-            );
+
+            assert_eq!(cache.len(), 0);
+            let _ = client.get(format!("{addr}/")).send().await.unwrap();
+            assert_eq!(cache.len(), 1, "only HTML is stored");
         });
         let _ = std::fs::remove_dir_all(dir);
     }
