@@ -1,10 +1,12 @@
 //! Rust inject for Chat HTML only (not Level / Sprites / Bestiary / S3).
 //!
-//! Live `chat.mcpwork.space` is a Next.js Longgraph shell. The composer does
-//! `POST /api/agent/{id}` with JSON and gets `202 {"runId","threadId"}`. The
-//! run itself is `GET /api/runs/{uuid}?since=` with `Accept: text/event-stream`,
-//! parsed from `fetch().body.getReader()` (not `EventSource`, not CopilotKit
-//! `HttpAgent`, not protobuf). Relative `/api/runs` already hits the Chat
+//! Live `chat.mcpwork.space` is `hermes-scout-olimpic` (Next.js). The composer
+//! (`app/chat.tsx`) does `POST /api/agent/{agentId}` with JSON and gets
+//! `202 {"runId","threadId"}`. The run itself (`app/agui.ts` `streamRunEvents`)
+//! is `GET /api/runs/{runId}?since={cursor}` with `Accept: text/event-stream`,
+//! parsed by hand from `fetch().body.getReader()` (not `EventSource`, not
+//! CopilotKit `HttpAgent`, not protobuf; `@ag-ui/client` is not imported).
+//! Cancel is `POST /api/runs/{runId}/cancel`. Relative `/api/runs` already hits the Chat
 //! loopback SSO proxy (`is_chat_run_sse_path`). The inject script still patches
 //! `window.fetch` so GET event-stream / GET `/api/runs/{uuid}` (relative or
 //! absolute) is rewritten to [`STUDIO_AGUI_PATH`] with the native jar. POST
