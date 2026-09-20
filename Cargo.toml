@@ -3,7 +3,7 @@ name = "designer_studio"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.95"
-description = "Local Tauri desk: chrome + Authentik cookie proxy to the live stand (Level / Sprites / Bestiary)"
+description = "Local Tauri desk: chrome + Authentik cookie proxy to the live stand (Level / Sprites / Bestiary) and system SSO apps (Chat / S3)"
 repository = "https://github.com/hewimetall/game_designer_studio"
 homepage = "https://github.com/hewimetall/game_designer_studio/releases"
 

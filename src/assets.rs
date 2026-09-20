@@ -864,17 +864,12 @@ mod tests {
         use crate::cache::ReadCache;
         use crate::session::LiveState;
         use std::sync::Arc;
-        let cfg = StudioConfig {
-            stand_host,
-            auth_host: "http://127.0.0.1:9".into(),
-            cache_dir: root.join("cache"),
-            ui_dir: root.join("ui"),
-            bind_port: 0,
-            get_timeout: std::time::Duration::from_secs(3),
-            write_timeout: std::time::Duration::from_secs(3),
-            probe_timeout: std::time::Duration::from_secs(1),
-            flow_slug: "default-authentication-flow".into(),
-        };
+        let mut cfg = StudioConfig::production(root.join("ui"), 0, Some(root.join("cache")));
+        cfg.stand_host = stand_host;
+        cfg.auth_host = "http://127.0.0.1:9".into();
+        cfg.get_timeout = std::time::Duration::from_secs(3);
+        cfg.write_timeout = std::time::Duration::from_secs(3);
+        cfg.probe_timeout = std::time::Duration::from_secs(1);
         Proxy {
             cache: ReadCache::open(cfg.cache_dir.join("reads")).unwrap(),
             live: Arc::new(LiveState::new()),

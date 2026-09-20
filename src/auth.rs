@@ -62,6 +62,7 @@ pub async fn login_with_password(
                 follow_flow_redirect(&client, cfg, to.as_deref()).await;
                 let who = verify_authentik_user(&client, cfg).await?;
                 settle_stand_cookie(&client, cfg, slug).await?;
+                crate::sso::settle_system_apps(&client, cfg).await;
                 return Ok(Session {
                     slug: slug.to_string(),
                     username: who,

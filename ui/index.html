@@ -249,9 +249,9 @@
   </head>
   <body>
     <header class="ticket">
-      <div class="brand" title="локальный стол · стенд · без Game и A-Life">
+      <div class="brand" title="локальный стол · стенд · Chat / S3 · без Game и A-Life">
         <strong>METRO-ARK</strong>
-        <span class="lede">локальный стол · стенд · без Game и A-Life</span>
+        <span class="lede">локальный стол · стенд · Chat / S3 · без Game и A-Life</span>
         <span class="who" id="who" hidden></span>
       </div>
       <nav class="stations" id="stations" hidden></nav>
@@ -294,8 +294,11 @@
       const desks = document.getElementById("desks");
       const err = document.getElementById("err");
       const who = document.getElementById("who");
-      const frames = new Map();
-      let slug = "";
+      let studioTabs = [];
+
+      function tabPath(tab, nextSlug) {
+        return String((tab && tab.path) || "").replaceAll("{slug}", nextSlug || slug || "");
+      }
       const xfer = document.getElementById("xfer");
       const xferRail = document.getElementById("xferRail");
       const xferLabel = document.getElementById("xferLabel");
@@ -539,7 +542,7 @@
           const url = new URL(href, "http://127.0.0.1/");
           const parts = url.pathname.split("/").filter(Boolean);
           const app = parts[0] === "stand" ? parts[2] : parts[0];
-          if (app === "level" || app === "sprites" || app === "bestiary" || app === "game" || app === "alife") {
+          if (app === "level" || app === "sprites" || app === "bestiary" || app === "game" || app === "alife" || app === "chat" || app === "s3") {
             return app;
           }
         } catch (_e) {}
@@ -653,11 +656,11 @@
           });
           desks.appendChild(iframe);
           frames.set(tab.id, iframe);
-          iframe.src = tab.path;
+          iframe.src = tabPath(tab);
         } else if (tab.id === "bestiary") {
           // Sprites save does not notify this desk. Reload so kind→atlas→idle
           // re-fetches instead of keeping the pre-save in-memory snapshot.
-          iframe.src = tab.path;
+          iframe.src = tabPath(tab);
         } else {
           hideTabLoadSoon();
         }
@@ -671,18 +674,19 @@
           who.textContent = username + " · " + nextSlug;
         }
         const studio = await (await fetch("/api/studio")).json();
+        studioTabs = studio.tabs || [];
         stations.innerHTML = "";
-        studio.tabs.forEach((tab, i) => {
+        studioTabs.forEach((tab, i) => {
           const button = document.createElement("button");
           button.className = "station";
           button.type = "button";
           button.dataset.tab = tab.id;
           button.textContent = tab.label;
           button.title = tab.code;
-          const path = "/stand/" + slug + "/" + tab.id + "/";
-          button.addEventListener("click", () => openTab({ id: tab.id, label: tab.label, path }, button));
+          const desk = { id: tab.id, label: tab.label, path: tabPath(tab, nextSlug), kind: tab.kind };
+          button.addEventListener("click", () => openTab(desk, button));
           stations.appendChild(button);
-          if (i === 0) openTab({ id: tab.id, label: tab.label, path }, button);
+          if (i === 0) openTab(desk, button);
         });
         stations.hidden = false;
         sync.hidden = false;
@@ -736,7 +740,8 @@
         await refreshStatus();
         const bestiary = frames.get("bestiary");
         if (bestiary) {
-          bestiary.src = "/stand/" + slug + "/bestiary/";
+          const tab = studioTabs.find((item) => item.id === "bestiary");
+          bestiary.src = tabPath(tab || { path: "/stand/{slug}/bestiary/" });
         }
       });
 

@@ -12,7 +12,7 @@ use serde::Deserialize;
 use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
 
-use crate::apps::DesignerTab;
+use crate::apps::{DesignerTab, SystemTab};
 use crate::assets::{
     baked_is_packaged, looks_like_packaged_editor, read_chrome, read_spa, refresh_app,
     refresh_app_join, SpaSource,
@@ -25,6 +25,7 @@ use crate::proxy::Proxy;
 use crate::remember::{self, RememberedLogin};
 use crate::session::LiveState;
 use crate::slug::parse_slug;
+use crate::sso::{self, SsoBind};
 use crate::stand::{
     atlas_paths_from_bindings, health_path, level_paths_from_list, prefetch_json_paths,
 };
@@ -32,12 +33,14 @@ use crate::stand::{
 #[derive(Clone)]
 struct AppState {
     proxy: Arc<Proxy>,
+    sso: Arc<Vec<SsoBind>>,
 }
 
 #[derive(Debug, Clone)]
 pub struct LocalHost {
     pub addr: SocketAddr,
     pub progress: Arc<ProgressHub>,
+    pub sso: Vec<SsoBind>,
 }
 
 impl LocalHost {
@@ -53,6 +56,22 @@ pub fn bind_local_host(cfg: StudioConfig) -> Result<LocalHost, String> {
         .set_nonblocking(true)
         .map_err(|err| err.to_string())?;
     let bound = listener.local_addr().map_err(|err| err.to_string())?;
+    let mut sso_listeners = Vec::new();
+    let mut sso_binds = Vec::new();
+    for tab in SystemTab::ALL {
+        let sso_listener = std::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .map_err(|err| err.to_string())?;
+        sso_listener
+            .set_nonblocking(true)
+            .map_err(|err| err.to_string())?;
+        let sso_addr = sso_listener.local_addr().map_err(|err| err.to_string())?;
+        sso_binds.push(SsoBind {
+            tab,
+            origin: cfg.origin_for_system(tab).to_string(),
+            port: sso_addr.port(),
+        });
+        sso_listeners.push(sso_listener);
+    }
     let cache = ReadCache::open(cfg.cache_dir.join("reads")).map_err(|err| err.to_string())?;
     let live = Arc::new(LiveState::new());
     let progress = ProgressHub::new();
@@ -62,6 +81,7 @@ pub fn bind_local_host(cfg: StudioConfig) -> Result<LocalHost, String> {
         live: live.clone(),
         progress: progress.clone(),
     });
+    let sso = Arc::new(sso_binds.clone());
 
     thread::Builder::new()
         .name("designer-studio-host".into())
@@ -71,7 +91,14 @@ pub fn bind_local_host(cfg: StudioConfig) -> Result<LocalHost, String> {
                 let listener = TcpListener::from_std(listener).expect("async listener");
                 let probe = proxy.clone();
                 tokio::spawn(async move { probe_loop(probe).await });
-                axum::serve(listener, router(proxy))
+                for (bind, std_lis) in sso.iter().cloned().zip(sso_listeners) {
+                    let proxy = proxy.clone();
+                    tokio::spawn(async move {
+                        let listener = TcpListener::from_std(std_lis).expect("sso listener");
+                        let _ = axum::serve(listener, sso::router(proxy, bind.origin)).await;
+                    });
+                }
+                axum::serve(listener, router(proxy, sso))
                     .await
                     .expect("host serve");
             });
@@ -81,10 +108,11 @@ pub fn bind_local_host(cfg: StudioConfig) -> Result<LocalHost, String> {
     Ok(LocalHost {
         addr: bound,
         progress,
+        sso: sso_binds,
     })
 }
 
-fn router(proxy: Arc<Proxy>) -> Router {
+fn router(proxy: Arc<Proxy>, sso: Arc<Vec<SsoBind>>) -> Router {
     Router::new()
         .route("/", get(chrome))
         .route("/api/studio", get(studio_manifest))
@@ -97,23 +125,46 @@ fn router(proxy: Arc<Proxy>) -> Router {
         .route("/stand/{slug}/{app}", get(spa_slash))
         .route("/stand/{slug}/{app}/", get(spa_index))
         .route("/stand/{slug}/{app}/{*rest}", get(spa_asset))
-        .with_state(AppState { proxy })
+        .with_state(AppState { proxy, sso })
 }
 
 async fn chrome(State(state): State<AppState>) -> Html<String> {
     Html(read_chrome(&state.proxy.cfg))
 }
 
-async fn studio_manifest() -> Json<serde_json::Value> {
+async fn studio_manifest(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let slug = state
+        .proxy
+        .live
+        .session()
+        .map(|session| session.slug.clone());
+    let mut tabs = Vec::new();
+    for tab in DesignerTab::ALL {
+        let path = match &slug {
+            Some(slug) => tab.stand_path(slug),
+            None => format!("/stand/{{slug}}/{}/", tab.id()),
+        };
+        tabs.push(serde_json::json!({
+            "id": tab.id(),
+            "label": tab.label(),
+            "code": tab.station_code(),
+            "kind": "stand",
+            "path": path,
+        }));
+    }
+    for app in state.sso.iter() {
+        tabs.push(serde_json::json!({
+            "id": app.tab.id(),
+            "label": app.tab.label(),
+            "code": app.tab.station_code(),
+            "kind": "sso",
+            "path": app.chrome_path(),
+            "origin": app.origin,
+        }));
+    }
     Json(serde_json::json!({
         "product": "METRO-ARK Studio",
-        "tabs": DesignerTab::ALL.iter().map(|tab| {
-            serde_json::json!({
-                "id": tab.id(),
-                "label": tab.label(),
-                "code": tab.station_code(),
-            })
-        }).collect::<Vec<_>>(),
+        "tabs": tabs,
         "excluded": ["game", "alife"],
     }))
 }
@@ -524,6 +575,9 @@ mod tests {
         assert!(html.contains("name=\"remember\""));
         assert!(html.contains("Запомнить вход"));
         assert!(html.contains("fillRemembered"));
+        assert!(html.contains("tabPath"));
+        assert!(html.contains("studioTabs"));
+        assert!(!html.contains("\"/stand/\" + slug + \"/\" + tab.id"));
         assert!(html.contains("isTauriWebview"));
         assert!(html.contains("__TAURI_INTERNALS__"));
         assert!(html.contains("listen(\"studio-progress\""));
@@ -576,8 +630,15 @@ mod tests {
                 .iter()
                 .map(|tab| tab["id"].as_str().unwrap())
                 .collect();
-            assert_eq!(ids, ["level", "sprites", "bestiary"]);
+            assert_eq!(ids, ["level", "sprites", "bestiary", "chat", "s3"]);
             assert_eq!(studio["excluded"], serde_json::json!(["game", "alife"]));
+            assert_eq!(studio["tabs"][0]["kind"], "stand");
+            assert_eq!(studio["tabs"][0]["path"], "/stand/{slug}/level/");
+            assert_eq!(studio["tabs"][3]["kind"], "sso");
+            let chat_path = studio["tabs"][3]["path"].as_str().unwrap();
+            assert!(chat_path.starts_with("http://127.0.0.1:"));
+            assert_eq!(studio["tabs"][3]["origin"], "https://chat.mcpwork.space");
+            assert_eq!(studio["tabs"][4]["origin"], "https://s3.mcpwork.space");
 
             let session: serde_json::Value = client
                 .get(format!("{base}api/session"))
@@ -628,12 +689,13 @@ mod tests {
             assert!(home.contains("id=\"desks\""));
             assert!(home.contains("id=\"xfer\""));
             assert!(home.contains("/api/studio/progress"));
-            assert!(home.contains("tab.id === \"bestiary\""));
-            assert!(home.contains("bestiary.src = \"/stand/\" + slug + \"/bestiary/\""));
+            assert!(home.contains("tabPath"));
+            assert!(home.contains("studioTabs"));
             assert!(home.contains("name=\"remember\""));
             assert!(home.contains("Запомнить вход"));
             assert!(home.contains("fillRemembered"));
             assert!(!home.contains("src=\"/stand"));
+            assert!(!home.contains("\"/stand/\" + slug + \"/\" + tab.id"));
 
             let no_follow = reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
@@ -685,6 +747,21 @@ mod tests {
                     .status(),
                 reqwest::StatusCode::NOT_FOUND
             );
+            let chat_port = host
+                .sso
+                .iter()
+                .find(|app| app.tab.id() == "chat")
+                .unwrap()
+                .port;
+            assert_eq!(
+                client
+                    .get(format!("http://127.0.0.1:{chat_port}/api/me"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                reqwest::StatusCode::UNAUTHORIZED
+            );
             assert_eq!(
                 client
                     .get(format!("{base}stand/NewEditor/level/"))
@@ -701,7 +778,11 @@ mod tests {
                 .unwrap();
             assert_eq!(spa.status(), reqwest::StatusCode::OK);
             let body = spa.text().await.unwrap();
-            assert!(body.contains("id=\"root\"") || body.contains("assets/") || body.contains("data-studio-placeholder"));
+            assert!(
+                body.contains("id=\"root\"")
+                    || body.contains("assets/")
+                    || body.contains("data-studio-placeholder")
+            );
             assert!(!body.contains("/game"));
         });
         let _ = std::fs::remove_dir_all(root);
@@ -731,8 +812,8 @@ mod tests {
             },
         )
         .unwrap();
-        let host = bind_local_host(StudioConfig::production(ui, 0, Some(cache.clone())))
-            .expect("bind");
+        let host =
+            bind_local_host(StudioConfig::production(ui, 0, Some(cache.clone()))).expect("bind");
         std::thread::sleep(std::time::Duration::from_millis(150));
         let base = host.chrome_url();
         let rt = Runtime::new().unwrap();

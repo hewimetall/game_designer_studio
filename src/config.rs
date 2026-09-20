@@ -5,6 +5,8 @@ use std::time::Duration;
 pub struct StudioConfig {
     pub stand_host: String,
     pub auth_host: String,
+    pub chat_host: String,
+    pub s3_host: String,
     pub flow_slug: String,
     pub cache_dir: PathBuf,
     pub ui_dir: PathBuf,
@@ -19,6 +21,8 @@ impl StudioConfig {
         Self {
             stand_host: "https://my.mcpwork.space".into(),
             auth_host: "https://auth.mcpwork.space".into(),
+            chat_host: crate::apps::SystemTab::Chat.production_origin().into(),
+            s3_host: crate::apps::SystemTab::S3.production_origin().into(),
             flow_slug: "default-authentication-flow".into(),
             cache_dir: cache_dir.unwrap_or_else(default_cache_dir),
             ui_dir,
@@ -41,6 +45,13 @@ impl StudioConfig {
     #[inline]
     pub fn stand_origin(&self) -> &str {
         self.stand_host.trim_end_matches('/')
+    }
+
+    pub fn origin_for_system(&self, tab: crate::apps::SystemTab) -> &str {
+        match tab {
+            crate::apps::SystemTab::Chat => self.chat_host.trim_end_matches('/'),
+            crate::apps::SystemTab::S3 => self.s3_host.trim_end_matches('/'),
+        }
     }
 
     #[inline]
@@ -71,6 +82,15 @@ impl StudioConfig {
     pub fn url_host_is_stand(&self, url: &reqwest::Url) -> bool {
         url.host_str()
             .is_some_and(|host| Some(host) == Self::origin_host(self.stand_origin()))
+    }
+
+    /// Host + port, so loopback test origins on different ports do not collide.
+    pub fn url_matches_origin(url: &reqwest::Url, origin: &str) -> bool {
+        let Ok(want) = reqwest::Url::parse(origin) else {
+            return false;
+        };
+        url.host_str() == want.host_str()
+            && url.port_or_known_default() == want.port_or_known_default()
     }
 }
 
@@ -142,6 +162,14 @@ mod tests {
         );
         assert_eq!(cfg.stand_origin(), "https://my.mcpwork.space");
         assert_eq!(
+            cfg.origin_for_system(crate::apps::SystemTab::Chat),
+            "https://chat.mcpwork.space"
+        );
+        assert_eq!(
+            cfg.origin_for_system(crate::apps::SystemTab::S3),
+            "https://s3.mcpwork.space"
+        );
+        assert_eq!(
             cfg.whoami_url(),
             "https://auth.mcpwork.space/api/v3/core/users/me/"
         );
@@ -154,6 +182,20 @@ mod tests {
             StudioConfig::origin_host("http://127.0.0.1:9"),
             Some("127.0.0.1")
         );
+        let chat = reqwest::Url::parse("https://chat.mcpwork.space/ws").unwrap();
+        assert!(StudioConfig::url_matches_origin(
+            &chat,
+            "https://chat.mcpwork.space"
+        ));
+        assert!(!StudioConfig::url_matches_origin(
+            &chat,
+            "https://auth.mcpwork.space"
+        ));
+        let loop_a = reqwest::Url::parse("http://127.0.0.1:1111/").unwrap();
+        assert!(!StudioConfig::url_matches_origin(
+            &loop_a,
+            "http://127.0.0.1:2222"
+        ));
     }
 
     #[test]

@@ -45,7 +45,11 @@ pub fn load(cache_dir: &Path) -> Option<RememberedLogin> {
     }
     let mut password = get_secret(cache_dir, username).unwrap_or_default();
     if password.is_empty() {
-        if let Some(legacy) = meta.password.as_deref().map(str::trim).filter(|s| !s.is_empty())
+        if let Some(legacy) = meta
+            .password
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
         {
             let _ = set_secret(cache_dir, username, legacy);
             let _ = rewrite_meta(cache_dir, slug, username);
@@ -203,11 +207,8 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let dir = std::env::temp_dir().join(format!(
-            "studio-remember-{}-{}",
-            std::process::id(),
-            stamp
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("studio-remember-{}-{}", std::process::id(), stamp));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -248,11 +249,7 @@ mod tests {
     #[test]
     fn blank_fields_are_ignored() {
         let dir = temp_dir();
-        std::fs::write(
-            remember_path(&dir),
-            r#"{"slug":"  ","username":"akadmin"}"#,
-        )
-        .unwrap();
+        std::fs::write(remember_path(&dir), r#"{"slug":"  ","username":"akadmin"}"#).unwrap();
         assert!(load(&dir).is_none());
         let _ = std::fs::remove_dir_all(dir);
     }

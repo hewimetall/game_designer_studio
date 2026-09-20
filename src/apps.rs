@@ -7,6 +7,14 @@ pub enum DesignerTab {
     Bestiary,
 }
 
+/// System-wide Authentik apps (not stand editors). Own loopback port, `base: "/"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SystemTab {
+    Chat,
+    S3,
+}
+
 impl DesignerTab {
     pub const ALL: [DesignerTab; 3] = [
         DesignerTab::Level,
@@ -51,6 +59,42 @@ impl DesignerTab {
     }
 }
 
+impl SystemTab {
+    pub const ALL: [SystemTab; 2] = [SystemTab::Chat, SystemTab::S3];
+
+    #[inline]
+    pub fn id(self) -> &'static str {
+        match self {
+            SystemTab::Chat => "chat",
+            SystemTab::S3 => "s3",
+        }
+    }
+
+    #[inline]
+    pub fn label(self) -> &'static str {
+        match self {
+            SystemTab::Chat => "Chat",
+            SystemTab::S3 => "S3",
+        }
+    }
+
+    #[inline]
+    pub fn station_code(self) -> &'static str {
+        match self {
+            SystemTab::Chat => "CHT",
+            SystemTab::S3 => "S3",
+        }
+    }
+
+    #[inline]
+    pub fn production_origin(self) -> &'static str {
+        match self {
+            SystemTab::Chat => "https://chat.mcpwork.space",
+            SystemTab::S3 => "https://s3.mcpwork.space",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -72,5 +116,21 @@ mod tests {
         assert!(DesignerTab::Sprites
             .stand_path("neweditor")
             .starts_with("/stand/neweditor/"));
+    }
+
+    #[test]
+    fn system_tabs_are_chat_and_s3_on_dedicated_hosts() {
+        let ids: Vec<_> = SystemTab::ALL.iter().map(|tab| tab.id()).collect();
+        assert_eq!(ids, ["chat", "s3"]);
+        assert_eq!(
+            SystemTab::Chat.production_origin(),
+            "https://chat.mcpwork.space"
+        );
+        assert_eq!(
+            SystemTab::S3.production_origin(),
+            "https://s3.mcpwork.space"
+        );
+        assert!(DesignerTab::from_id("chat").is_none());
+        assert!(DesignerTab::from_id("s3").is_none());
     }
 }

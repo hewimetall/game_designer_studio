@@ -2,7 +2,7 @@
 
 Local Tauri **chrome** for a weak link: login, tabs, progress. Editors are **not** in this binary.
 
-**Level / Sprites / Bestiary** load from the live stand `https://my.mcpwork.space/stand/<slug>/…` through the local proxy + overlay cache. No Game, no A-Life, no Bevy, no `tool_server`, no `src/web` editors.
+**Level / Sprites / Bestiary** load from the live stand `https://my.mcpwork.space/stand/<slug>/…` through the local proxy + overlay cache. **Chat** and **S3** share the same Authentik SSO (`Domain=mcpwork.space`) on extra loopback ports to `chat.mcpwork.space` / `s3.mcpwork.space` — their Vite apps use `base: "/"` and would collide with studio `/api/*` on the chrome port. No Game, no A-Life, no Bevy, no `tool_server`, no `src/web` editors.
 
 Installers are **GitHub Releases** on this public repo (free Actions on public; NSIS/APK are not npm/NuGet packages):
 
@@ -30,7 +30,7 @@ You do not need npm, cargo, or a UI packaging script.
 
 ## Developers
 
-This repo is chrome-only. Hashed Vite SPAs under `ui/level`, `ui/sprites`, `ui/bestiary` must not be committed. After login the iframe hits `/stand/<slug>/<app>/`; Axum fills the overlay from the stand.
+This repo is chrome-only. Hashed Vite SPAs under `ui/level`, `ui/sprites`, `ui/bestiary` must not be committed. After login the iframe hits `/stand/<slug>/<app>/` for editors; Chat / S3 iframes hit extra `127.0.0.1` ports (same Authentik jar). Axum fills editor overlay from the stand.
 
 ```bash
 cargo +1.95 run -- --no-window   # proxy only
