@@ -13,6 +13,9 @@ pub struct StudioConfig {
     pub bind_port: u16,
     pub get_timeout: Duration,
     pub write_timeout: Duration,
+    /// Overall timeout for AG-UI / SSE runs (HTTP POST + `text/event-stream`).
+    /// Must be minutes-long: a GET/write timeout would kill the composer mid-run.
+    pub stream_timeout: Duration,
     pub probe_timeout: Duration,
 }
 
@@ -29,6 +32,7 @@ impl StudioConfig {
             bind_port,
             get_timeout: Duration::from_millis(8000),
             write_timeout: Duration::from_millis(20_000),
+            stream_timeout: Duration::from_secs(15 * 60),
             probe_timeout: Duration::from_millis(2000),
         }
     }
@@ -185,6 +189,7 @@ mod tests {
             "https://auth.mcpwork.space/api/v3/core/users/me/"
         );
         assert_eq!(cfg.auth_origin(), "https://auth.mcpwork.space");
+        assert!(cfg.stream_timeout >= Duration::from_secs(5 * 60));
         assert_eq!(
             cfg.cookie_jar_urls(),
             vec![
