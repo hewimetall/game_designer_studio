@@ -127,6 +127,7 @@ fn router(proxy: Arc<Proxy>, sso: Arc<Vec<SsoBind>>) -> Router {
         .route("/api/session", get(session_status))
         .route("/api/session/login", post(login))
         .route("/api/session/logout", post(logout))
+        .route("/api/studio/ag-ui", axum::routing::any(chrome_agui))
         .route("/stand/{slug}/api/{*rest}", axum::routing::any(stand_api))
         .route("/stand/{slug}/{app}", get(spa_slash))
         .route("/stand/{slug}/{app}/", get(spa_index))
@@ -136,6 +137,23 @@ fn router(proxy: Arc<Proxy>, sso: Arc<Vec<SsoBind>>) -> Router {
 
 async fn chrome(State(state): State<AppState>) -> Html<String> {
     Html(read_chrome(&state.proxy.cfg))
+}
+
+async fn chrome_agui(
+    State(state): State<AppState>,
+    method: Method,
+    headers: HeaderMap,
+    uri: Uri,
+    body: Bytes,
+) -> axum::response::Response {
+    let origin = state
+        .sso
+        .iter()
+        .find(|app| app.tab == SystemTab::Chat)
+        .map(|app| app.origin.as_str())
+        .unwrap_or_else(|| state.proxy.cfg.origin_for_system(SystemTab::Chat))
+        .to_string();
+    sso::handle_studio_agui(&state.proxy, &origin, method, headers, uri, body).await
 }
 
 async fn studio_manifest(State(state): State<AppState>) -> Json<serde_json::Value> {
@@ -823,6 +841,18 @@ mod tests {
             assert_eq!(
                 client
                     .get(format!("http://127.0.0.1:{chat_port}/api/me"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                reqwest::StatusCode::UNAUTHORIZED
+            );
+            assert_eq!(
+                client
+                    .post(format!("{base}api/studio/ag-ui?to=/agent"))
+                    .header("accept", "text/event-stream")
+                    .header("content-type", "application/json")
+                    .body(r#"{"threadId":"t1","runId":"r1","messages":[]}"#)
                     .send()
                     .await
                     .unwrap()

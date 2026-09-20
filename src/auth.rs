@@ -59,12 +59,7 @@ pub async fn login_with_password(
                 // Cheap stand GET so the outpost cookie lands. Chat/S3 settle is
                 // background work after login returns JSON.
                 settle_stand_cookie(&client, cfg, slug).await?;
-                return Ok(Session {
-                    slug: slug.to_string(),
-                    username: who,
-                    client,
-                    jar,
-                });
+                return Session::new(slug.to_string(), who, jar);
             }
         }
     }
@@ -79,12 +74,7 @@ pub async fn resume_from_jar(
 ) -> Result<Session, String> {
     let client = build_client(jar.clone())?;
     let who = verify_authentik_user_timed(&client, cfg, cfg.probe_timeout).await?;
-    Ok(Session {
-        slug: slug.to_string(),
-        username: who,
-        client,
-        jar,
-    })
+    Session::new(slug.to_string(), who, jar)
 }
 
 /// Check `response_errors` / deny / restart **before** posting again.

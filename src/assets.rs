@@ -880,12 +880,12 @@ mod tests {
 
     fn test_session() -> Session {
         use std::sync::Arc;
-        Session {
-            slug: "cursorgo".into(),
-            username: "tester".into(),
-            client: reqwest::Client::new(),
-            jar: Arc::new(reqwest::cookie::Jar::default()),
-        }
+        Session::new(
+            "cursorgo".into(),
+            "tester".into(),
+            Arc::new(reqwest::cookie::Jar::default()),
+        )
+        .unwrap()
     }
 
     async fn spawn_mock_stand(pages: std::collections::HashMap<String, Bytes>) -> String {

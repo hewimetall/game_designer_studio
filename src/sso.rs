@@ -143,7 +143,7 @@ async fn sso_any(
     if state.tab == SystemTab::Chat && looks_like_chat_document(&method, path, &headers) {
         return chat_document(&session, &state, path, &pq, headers).await;
     }
-    let timeout = sso_timeout(&method, &headers, &state.proxy.cfg);
+    let timeout = sso_timeout(&method, &headers, &pq, &state.proxy.cfg);
     forward_sso(&session, &state.origin, method, &pq, headers, body, timeout).await
 }
 
@@ -463,7 +463,7 @@ fn looks_like_chat_document(method: &Method, path: &str, headers: &HeaderMap) ->
     if *method != Method::GET {
         return false;
     }
-    if wants_event_stream(headers) {
+    if is_sse_request(headers, path) {
         return false;
     }
     let path_only = path.split('?').next().unwrap_or(path);
@@ -540,9 +540,13 @@ pub async fn forward_sso(
 ) -> axum::response::Response {
     let origin = origin.trim_end_matches('/');
     let url = format!("{origin}{path_and_query}");
-    let stream_run = wants_event_stream(&incoming);
-    let mut req = session
-        .client
+    let stream_run = is_sse_request(&incoming, path_and_query);
+    let client = if stream_run {
+        &session.stream_client
+    } else {
+        &session.client
+    };
+    let mut req = client
         .request(
             reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap_or(reqwest::Method::GET),
             &url,
@@ -575,8 +579,18 @@ fn sso_unusable(res: &Response, origin: &str) -> bool {
 
 /// AG-UI HttpAgent: `Accept: text/event-stream`. Protobuf binding adds
 /// `application/vnd.ag-ui.event+proto` on the same POST.
+/// Live METRO-ARK chat also GETs `/api/runs/{id}?since=` as SSE.
 fn wants_event_stream(headers: &HeaderMap) -> bool {
     accept_is_agui_stream(headers.get(axum::http::header::ACCEPT))
+}
+
+fn is_runs_sse_path(path: &str) -> bool {
+    let p = path.split('?').next().unwrap_or(path);
+    p == "/api/runs" || p.starts_with("/api/runs/")
+}
+
+fn is_sse_request(headers: &HeaderMap, path: &str) -> bool {
+    wants_event_stream(headers) || is_runs_sse_path(path)
 }
 
 fn accept_is_agui_stream(value: Option<&HeaderValue>) -> bool {
@@ -590,8 +604,8 @@ fn is_agui_stream_accept(accept: &str) -> bool {
     accept.contains("text/event-stream") || accept.contains("application/vnd.ag-ui.event+proto")
 }
 
-fn sso_timeout(method: &Method, incoming: &HeaderMap, cfg: &StudioConfig) -> Duration {
-    if wants_event_stream(incoming) {
+fn sso_timeout(method: &Method, incoming: &HeaderMap, path: &str, cfg: &StudioConfig) -> Duration {
+    if is_sse_request(incoming, path) {
         cfg.stream_timeout
     } else if *method == Method::GET || *method == Method::HEAD {
         cfg.get_timeout
@@ -687,7 +701,7 @@ mod tests {
     use super::*;
     use crate::cache::{now_secs, ReadCache};
     use crate::progress::ProgressHub;
-    use crate::session::{build_client, LiveState};
+    use crate::session::LiveState;
     use std::convert::Infallible;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -697,12 +711,7 @@ mod tests {
 
     fn dummy_session() -> Session {
         let jar = Arc::new(reqwest::cookie::Jar::default());
-        Session {
-            slug: "s".into(),
-            username: "u".into(),
-            client: build_client(jar.clone()).unwrap(),
-            jar,
-        }
+        Session::new("s".into(), "u".into(), jar).unwrap()
     }
 
     fn test_proxy(stand: String, cache_dir: std::path::PathBuf) -> Arc<Proxy> {
@@ -901,8 +910,18 @@ mod tests {
             axum::http::header::ACCEPT,
             HeaderValue::from_static("text/event-stream"),
         );
-        assert_eq!(sso_timeout(&Method::POST, &sse, &cfg), cfg.stream_timeout);
-        assert_eq!(sso_timeout(&Method::GET, &sse, &cfg), cfg.stream_timeout);
+        assert_eq!(
+            sso_timeout(&Method::POST, &sse, "/agent", &cfg),
+            cfg.stream_timeout
+        );
+        assert_eq!(
+            sso_timeout(&Method::GET, &sse, "/api/runs/x", &cfg),
+            cfg.stream_timeout
+        );
+        assert_eq!(
+            sso_timeout(&Method::GET, &HeaderMap::new(), "/api/runs/x?since=0", &cfg),
+            cfg.stream_timeout
+        );
         assert_ne!(cfg.stream_timeout, cfg.get_timeout);
         assert_ne!(cfg.stream_timeout, cfg.write_timeout);
         assert!(cfg.stream_timeout >= Duration::from_secs(5 * 60));
@@ -912,17 +931,24 @@ mod tests {
             axum::http::header::ACCEPT,
             HeaderValue::from_static("application/vnd.ag-ui.event+proto, text/event-stream;q=0.9"),
         );
-        assert_eq!(sso_timeout(&Method::POST, &proto, &cfg), cfg.stream_timeout);
         assert_eq!(
-            sso_timeout(&Method::GET, &HeaderMap::new(), &cfg),
+            sso_timeout(&Method::POST, &proto, "/agent", &cfg),
+            cfg.stream_timeout
+        );
+        assert_eq!(
+            sso_timeout(&Method::GET, &HeaderMap::new(), "/", &cfg),
             cfg.get_timeout
         );
         assert_eq!(
-            sso_timeout(&Method::POST, &HeaderMap::new(), &cfg),
+            sso_timeout(&Method::POST, &HeaderMap::new(), "/api/agent/game", &cfg),
             cfg.write_timeout
         );
         assert!(wants_event_stream(&sse));
         assert!(!wants_event_stream(&HeaderMap::new()));
+        assert!(is_runs_sse_path(
+            "/api/runs/30289690-b756-416a-ac0d-5bc9a3396ef7"
+        ));
+        assert!(!is_runs_sse_path("/api/agent/game"));
     }
 
     #[test]
