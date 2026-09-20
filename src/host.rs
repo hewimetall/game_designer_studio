@@ -22,6 +22,7 @@ use crate::cache::ReadCache;
 use crate::config::StudioConfig;
 use crate::progress::{Progress, ProgressHub};
 use crate::proxy::Proxy;
+use crate::remember::{self, RememberedLogin};
 use crate::session::LiveState;
 use crate::slug::parse_slug;
 use crate::stand::{
@@ -135,14 +136,28 @@ async fn sync_status(State(state): State<AppState>) -> Json<serde_json::Value> {
 }
 
 async fn session_status(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let remembered = remember::load(&state.proxy.cfg.cache_dir);
     match state.proxy.live.session() {
         Some(session) => Json(serde_json::json!({
             "authenticated": true,
             "slug": session.slug,
             "username": session.username,
             "desk": DesignerTab::Level.stand_path(&session.slug),
+            "remember": remembered.is_some(),
         })),
-        None => Json(serde_json::json!({ "authenticated": false })),
+        None => match remembered {
+            Some(login) => Json(serde_json::json!({
+                "authenticated": false,
+                "remember": true,
+                "slug": login.slug,
+                "username": login.username,
+                "password": login.password,
+            })),
+            None => Json(serde_json::json!({
+                "authenticated": false,
+                "remember": false,
+            })),
+        },
     }
 }
 
@@ -153,6 +168,8 @@ struct LoginBody {
     password: String,
     #[serde(default)]
     totp: Option<String>,
+    #[serde(default)]
+    remember: bool,
 }
 
 async fn login(
@@ -180,6 +197,18 @@ async fn login(
         )
     })?;
     let username = session.username.clone();
+    if body.remember {
+        let _ = remember::save(
+            &state.proxy.cfg.cache_dir,
+            &RememberedLogin {
+                slug: slug.clone(),
+                username: body.username.trim().to_string(),
+                password: body.password,
+            },
+        );
+    } else {
+        remember::clear(&state.proxy.cfg.cache_dir);
+    }
     state.proxy.live.set_session(session);
     if let Some(session) = state.proxy.live.session() {
         state.proxy.progress.begin("sync");
@@ -487,6 +516,9 @@ mod tests {
         assert!(html.contains("ЗАГРУЗКА"));
         assert!(html.contains("/api/studio/progress"));
         assert!(html.contains("studio-progress"));
+        assert!(html.contains("name=\"remember\""));
+        assert!(html.contains("Запомнить вход"));
+        assert!(html.contains("fillRemembered"));
         assert!(html.contains("isTauriWebview"));
         assert!(html.contains("__TAURI_INTERNALS__"));
         assert!(html.contains("listen(\"studio-progress\""));
@@ -551,6 +583,7 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(session["authenticated"], false);
+            assert_eq!(session["remember"], false);
 
             let sync: serde_json::Value = client
                 .get(format!("{base}api/studio/sync"))
@@ -592,6 +625,9 @@ mod tests {
             assert!(home.contains("/api/studio/progress"));
             assert!(home.contains("tab.id === \"bestiary\""));
             assert!(home.contains("bestiary.src = \"/stand/\" + slug + \"/bestiary/\""));
+            assert!(home.contains("name=\"remember\""));
+            assert!(home.contains("Запомнить вход"));
+            assert!(home.contains("fillRemembered"));
             assert!(!home.contains("src=\"/stand"));
 
             let no_follow = reqwest::Client::builder()
@@ -662,6 +698,67 @@ mod tests {
             let body = spa.text().await.unwrap();
             assert!(body.contains("id=\"root\"") || body.contains("assets/") || body.contains("data-studio-placeholder"));
             assert!(!body.contains("/game"));
+        });
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn remembered_login_is_returned_until_cleared() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let root = std::env::temp_dir().join(format!(
+            "designer-remember-{}-{}",
+            std::process::id(),
+            stamp
+        ));
+        let ui = root.join("ui");
+        std::fs::create_dir_all(&ui).unwrap();
+        std::fs::write(ui.join("index.html"), include_str!("../ui/index.html")).unwrap();
+        let cache = root.join("cache");
+        remember::save(
+            &cache,
+            &RememberedLogin {
+                slug: "neweditor".into(),
+                username: "akadmin".into(),
+                password: "secret".into(),
+            },
+        )
+        .unwrap();
+        let host = bind_local_host(StudioConfig::production(ui, 0, Some(cache.clone())))
+            .expect("bind");
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        let base = host.chrome_url();
+        let rt = Runtime::new().unwrap();
+        rt.block_on(async {
+            let client = reqwest::Client::new();
+            let session: serde_json::Value = client
+                .get(format!("{base}api/session"))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(session["authenticated"], false);
+            assert_eq!(session["remember"], true);
+            assert_eq!(session["slug"], "neweditor");
+            assert_eq!(session["username"], "akadmin");
+            assert_eq!(session["password"], "secret");
+
+            remember::clear(&cache);
+            let cleared: serde_json::Value = client
+                .get(format!("{base}api/session"))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(cleared["authenticated"], false);
+            assert_eq!(cleared["remember"], false);
+            assert!(cleared.get("password").is_none());
         });
         let _ = std::fs::remove_dir_all(root);
     }

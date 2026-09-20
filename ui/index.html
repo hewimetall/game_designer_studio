@@ -155,6 +155,20 @@
         text-transform: uppercase;
       }
       .gate input { width: 100%; }
+      .remember {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        min-height: 28px;
+        cursor: pointer;
+      }
+      .remember input {
+        width: 18px;
+        min-width: 18px;
+        min-height: 18px;
+        accent-color: var(--sodium);
+        cursor: pointer;
+      }
       .err {
         margin: 0;
         padding: 4px 8px;
@@ -252,10 +266,11 @@
     <main class="gate" id="gate">
       <form id="login">
         <p class="note">Тот же вход, что на <code>auth.mcpwork.space</code>: identification → password → TOTP. Cookie jar в приложении (официальный Flow Executor), не в WebView.</p>
-        <label>Стенд (slug)<input name="slug" required autocomplete="username" placeholder="neweditor" /></label>
+        <label>Стенд (slug)<input name="slug" required autocomplete="organization" placeholder="neweditor" /></label>
         <label>Логин<input name="username" required autocomplete="username" /></label>
         <label>Пароль<input name="password" type="password" required autocomplete="current-password" /></label>
         <label>TOTP, если есть<input name="totp" inputmode="numeric" autocomplete="one-time-code" /></label>
+        <label class="remember"><input type="checkbox" name="remember" id="remember" /> Запомнить вход на этом компьютере</label>
         <button class="primary" type="submit">Войти</button>
       </form>
     </main>
@@ -677,10 +692,26 @@
         await refreshStatus();
       }
 
+      function fillRemembered(s) {
+        const form = document.getElementById("login");
+        if (!form || !s) return;
+        if (s.slug) form.slug.value = s.slug;
+        if (s.username) form.username.value = s.username;
+        if (s.password) form.password.value = s.password;
+        form.remember.checked = !!s.remember;
+      }
+
       document.getElementById("login").addEventListener("submit", async (event) => {
         event.preventDefault();
         showErr("");
-        const data = Object.fromEntries(new FormData(event.target));
+        const form = event.target;
+        const data = {
+          slug: form.slug.value,
+          username: form.username.value,
+          password: form.password.value,
+          totp: form.totp.value,
+          remember: !!form.remember.checked,
+        };
         const res = await fetch("/api/session/login", {
           method: "POST",
           headers: { "content-type": "application/json" },
@@ -719,7 +750,10 @@
 
       fetch("/api/session")
         .then((r) => r.json())
-        .then((s) => { if (s.authenticated) return showDesk(s.slug, s.username); })
+        .then((s) => {
+          fillRemembered(s);
+          if (s.authenticated) return showDesk(s.slug, s.username);
+        })
         .catch(() => {});
     </script>
   </body>

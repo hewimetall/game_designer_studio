@@ -9,6 +9,7 @@ mod config;
 mod host;
 mod progress;
 mod proxy;
+mod remember;
 mod session;
 mod slug;
 mod stand;

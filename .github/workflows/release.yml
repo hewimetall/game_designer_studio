@@ -259,9 +259,12 @@ jobs:
         with:
           path: dist
 
+      # No checkout in this job. Without GH_REPO, `gh` runs git and fails in ~3s:
+      # "fatal: not a git repository (or any of the parent directories): .git"
       - name: upload Release assets
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           mapfile -t files < <(find dist -type f | sort)
@@ -269,6 +272,8 @@ jobs:
             echo "no artifacts to attach" >&2
             exit 1
           fi
+          printf 'attaching %s files:\n' "${#files[@]}"
+          printf '  %s\n' "${files[@]}"
           notes="$(cat <<'EOF'
           Designer Studio chrome for METRO-ARK (Level / Sprites / Bestiary from the live stand). No Game, no A-Life.
 
@@ -286,10 +291,12 @@ jobs:
           EOF
           )"
           tag="${GITHUB_REF_NAME}"
-          if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" "${files[@]}" --clobber
+          repo="${GITHUB_REPOSITORY}"
+          if gh release view "$tag" --repo "$repo" >/dev/null 2>&1; then
+            gh release upload "$tag" "${files[@]}" --repo "$repo" --clobber
           else
             gh release create "$tag" "${files[@]}" \
+              --repo "$repo" \
               --title "$tag" \
               --notes "$notes"
           fi
