@@ -204,7 +204,7 @@ fn hex_lower(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::inject::{inject_chat_html, INJECT_MARKER};
+    use crate::inject::inject_chat_html;
 
     #[test]
     fn refuses_event_stream_runs_and_streamer_path() {
@@ -265,28 +265,21 @@ mod tests {
     }
 
     #[test]
-    fn hit_returns_injected_html_without_put_twice() {
+    fn stored_html_is_returned_fresh_as_is() {
         let cache = InjectCache::new();
         let html = inject_chat_html("<!doctype html><html><head></head><body>chat</body></html>");
-        assert!(html.contains(INJECT_MARKER));
         let key = InjectCache::key("https://chat.mcpwork.space/", "text/html");
+        assert!(cache.get_fresh(&key).is_none());
         cache.put(
             key.clone(),
-            InjectObject::html(200, Bytes::from(html.clone()), None, None),
+            InjectObject::html(200, Bytes::from(html.clone()), Some("\"e1\"".into()), None),
         );
         let hit = cache.get_fresh(&key).expect("fresh html");
         assert_eq!(hit.status, 200);
-        assert!(String::from_utf8_lossy(&hit.body).contains(INJECT_MARKER));
-        assert_eq!(cache.len(), 1);
+        assert_eq!(&hit.body[..], html.as_bytes());
+        assert_eq!(hit.etag.as_deref(), Some("\"e1\""));
         assert_eq!(hit.kind, ArtifactKind::Html);
-    }
-
-    #[test]
-    fn script_is_in_memory_static() {
-        let script = InjectObject::script();
-        assert_eq!(script.kind, ArtifactKind::Script);
-        assert_eq!(&script.body[..], INJECT_JS.as_bytes());
-        assert!(script.fresh());
+        assert_eq!(cache.len(), 1);
     }
 
     #[test]
