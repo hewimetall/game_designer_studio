@@ -108,7 +108,7 @@ jobs:
           if not bins:
               raise SystemExit(f"no cargo-tauri binary in {asset}")
           src_bin = bins[0]
-          dest = os.path.join(dest_dir, os.basename(src_bin))
+          dest = os.path.join(dest_dir, os.path.basename(src_bin))
           shutil.copy2(src_bin, dest)
           os.chmod(dest, 0o755)
           print("installed", dest)
